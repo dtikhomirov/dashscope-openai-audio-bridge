@@ -1,0 +1,9 @@
+services:
+  audio-bridge:
+    build: .
+    container_name: audio-bridge
+    env_file:
+      - .env
+    ports:
+      - "${BRIDGE_PORT}:${BRIDGE_PORT}"
+    restart: unless-stopped
