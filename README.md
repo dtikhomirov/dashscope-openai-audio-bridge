@@ -37,7 +37,16 @@ flowchart LR
     S -- "base64 data-URL (sync, SSE disabled)" --> ASR
     ASR -- "sentence.text" --> S
     S -- "JSON: {text}" --> C
+
+    classDef ttsFlow fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef sttFlow fill:#dcfce7,stroke:#16a34a,color:#14532d
+    class T,TTS,OSS ttsFlow
+    class S,ASR sttFlow
+    linkStyle 0,2,3,4,5,6 stroke:#2563eb,stroke-width:2px
+    linkStyle 1,7,8,9 stroke:#16a34a,stroke-width:2px
 ```
+
+_Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptions`)_
 
 <details>
 <summary>ASCII version (if Mermaid does not render)</summary>
