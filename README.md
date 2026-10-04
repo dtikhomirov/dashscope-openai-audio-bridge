@@ -2,7 +2,8 @@
 
 A lightweight FastAPI service that exposes **OpenAI-compatible audio endpoints** backed by
 [Alibaba Cloud Model Studio (DashScope)](https://www.alibabacloud.com/help/en/model-studio/)
-Qwen-Audio models on the **Token Plan (Singapore)** API.
+Qwen-Audio models. Works with any DashScope deployment — mainland China, International, or
+Token Plan — by pointing `ALI_TTS_URL` / `ALI_STT_URL` at your API host.
 
 Point any OpenAI SDK or client at this bridge and use Aliyun TTS/ASR models as if they were
 OpenAI audio models.
@@ -22,7 +23,7 @@ flowchart LR
         T["/v1/audio/speech<br/>TTS handler"]
         S["/v1/audio/transcriptions<br/>STT handler"]
     end
-    subgraph A["Aliyun Model Studio — Token Plan (Singapore)"]
+    subgraph A["Aliyun Model Studio (DashScope) — your region/deployment"]
         TTS["SpeechSynthesizer API<br/>qwen-audio-3.0-tts-plus"]
         ASR["Multimodal Generation API<br/>qwen-audio-3.0-asr-flash"]
         OSS["Audio download URL<br/>(valid 24 h)"]
@@ -57,7 +58,7 @@ _Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptio
 | client (SDK,curl)| <------------------------------ |  $BRIDGE_HOST:$BRIDGE_PORT  |
 +------------------+     audio bytes / {"text":..}   +--------------+--------------+
                                                                     |
-                            Token Plan (Singapore) HTTPS, Bearer key|
+                            DashScope HTTPS (any region), Bearer API key
                                                                     v
                              +----------------------------------------------+
                              | Aliyun Model Studio                          |
@@ -87,8 +88,9 @@ _Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptio
 ### Prerequisites
 
 - Python 3.10+ (or Docker)
-- An Aliyun Model Studio **Token Plan (Singapore)** API key with `qwen-audio-3.0-tts-plus`
-  and `qwen-audio-3.0-asr-flash` enabled
+- An Alibaba Cloud Model Studio (DashScope) API key — from any region/deployment
+  (mainland China, International, Token Plan) — with `qwen-audio-3.0-tts-plus`
+  and `qwen-audio-3.0-asr-flash` (or equivalent audio models) enabled
 
 ### 1. Configure
 
@@ -167,11 +169,11 @@ per problem and exits with code `2` instead of serving a misconfigured API.
 
 | Variable | Example | Description |
 |---|---|---|
-| `ALI_API_KEY` | `sk-…` | Aliyun Model Studio Token Plan API key |
+| `ALI_API_KEY` | `sk-…` | Aliyun Model Studio (DashScope) API key |
 | `BRIDGE_HOST` | `0.0.0.0` | Interface the bridge listens on |
 | `BRIDGE_PORT` | `4005` | Port the bridge listens on (1–65535) |
-| `ALI_TTS_URL` | `https://token-plan…/SpeechSynthesizer` | TTS endpoint (http/https URL) |
-| `ALI_STT_URL` | `https://token-plan…/multimodal-generation/generation` | STT endpoint (http/https URL) |
+| `ALI_TTS_URL` | `https://<dashscope-host>/api/v1/services/audio/tts/SpeechSynthesizer` | TTS endpoint (http/https URL) |
+| `ALI_STT_URL` | `https://<dashscope-host>/api/v1/services/aigc/multimodal-generation/generation` | STT endpoint (http/https URL) |
 | `TTS_MODEL` | `qwen-audio-3.0-tts-plus` | Default TTS model |
 | `TTS_VOICE` | `qwen-audio-3.0-tts-plus-loongjameszhao` | Default voice (news-anchor style male) |
 | `TTS_FORMAT` | `wav` | Default output format (`wav`, `mp3`, …) |
@@ -209,7 +211,7 @@ Default voice: `qwen-audio-3.0-tts-plus-loongjameszhao` (English news-anchor mal
 - **Voices cannot be mixed across models.** A voice belonging to another model (e.g.
   `loongmary` from `qwen-audio-3.0-tts-flash`) returns `[cosyvoice:] Engine error [411]`.
 - Explicit British/American accent voices (`Emily_v3.1`, `Eric_v3.1`, …) belong to
-  `qwen-audio-3.1-tts-flash`, which is not part of this token plan.
+  `qwen-audio-3.1-tts-flash` — check whether that model is available on your account.
 
 Docs: [voice list (EN)](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-voice-list) ·
 [voice list (ZH, most complete)](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list)
@@ -231,8 +233,8 @@ extension (unknown extensions are sent as `wav`).
 | Symptom | Cause / fix |
 |---|---|
 | Container/process exits at startup with `Invalid configuration` | A required env var is missing or invalid — each problem is listed in the log; fix `.env` (all variables are required, no code defaults) |
-| `401 InvalidApiKey` from upstream | Wrong key or key not valid for the **Singapore Token Plan** host |
-| `404` on TTS/STT | Model name not in your token plan (check `GET /health` for configured models) |
+| `401 InvalidApiKey` from upstream | Key does not match the configured `ALI_TTS_URL`/`ALI_STT_URL` host (e.g. key issued for a different region/deployment) |
+| `404` on TTS/STT | Model not available for your account/region (check `GET /health` for configured models) |
 | `[cosyvoice:] Engine error [411]` | Voice does not belong to `TTS_MODEL` — see [Voices](#voices) |
 | `413 Audio too large` | Upload exceeds `MAX_BASE64_BYTES` (ASR limit: 10 MB / 5 min) |
 | Empty `{"text": ""}` | Silent/unintelligible audio, or wrong `language` hint |
