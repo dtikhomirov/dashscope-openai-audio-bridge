@@ -77,7 +77,7 @@ _Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptio
 
 ### Request flow
 
-1. **TTS** — the client sends OpenAI-style JSON (`input`, optional `voice`/`response_format`/`sample_rate`).
+1. **TTS** — the client sends OpenAI-style JSON (required `model`/`voice`/`input`, optional `response_format`/`sample_rate`).
    The bridge calls the DashScope synthesizer (voice/format go **inside `input`**), receives a temporary
    download URL (`output.audio.url`, valid 24 h), fetches the audio, and streams the bytes back with the
    proper `Content-Type`.
@@ -131,7 +131,7 @@ misconfigured traffic.
 ```bash
 curl -s -X POST http://localhost:4005/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"model":"qwen-audio-3.0-tts-plus","input":"Hello from the DashScope audio bridge."}' \
+  -d '{"model":"qwen-audio-3.0-tts-plus","voice":"qwen-audio-3.0-tts-plus-loongjameszhao","input":"Hello from the DashScope audio bridge."}' \
   -o speech.wav
 ```
 
@@ -176,7 +176,6 @@ per problem and exits with code `2` instead of serving a misconfigured API.
 | `BRIDGE_PORT` | `4005` | Port the bridge listens on (1–65535) |
 | `ALI_TTS_URL` | `https://<dashscope-host>/api/v1/services/audio/tts/SpeechSynthesizer` | TTS endpoint (http/https URL) |
 | `ALI_STT_URL` | `https://<dashscope-host>/api/v1/services/aigc/multimodal-generation/generation` | STT endpoint (http/https URL) |
-| `TTS_VOICE` | `qwen-audio-3.0-tts-plus-loongjameszhao` | Default voice (news-anchor style male) |
 | `TTS_FORMAT` | `wav` | Default output format (`wav`, `mp3`, …) |
 | `TTS_SAMPLE_RATE` | `24000` | Output sample rate in Hz (1000–192000) |
 | `REQUEST_TIMEOUT` | `120` | Upstream HTTP timeout in seconds (> 0) |
@@ -184,9 +183,9 @@ per problem and exits with code `2` instead of serving a misconfigured API.
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 
 Per the OpenAI spec, `model` is **required in every request** (JSON body for TTS, multipart
-form for STT) and selects the DashScope model to call. Optional per-request overrides with
-env defaults (TTS only): `voice`, `response_format`, `sample_rate`; STT accepts an optional
-`language` hint.
+form for STT) and `voice` is **required for TTS**; they select the DashScope model and voice
+to call. Optional per-request overrides with env defaults (TTS only): `response_format`,
+`sample_rate`; STT accepts an optional `language` hint.
 
 ## Logging
 
@@ -206,7 +205,8 @@ The API key is never logged in full.
 
 ## Voices
 
-Default voice: `qwen-audio-3.0-tts-plus-loongjameszhao` (English news-anchor male).
+Every TTS request must pass a `voice`. The examples use `qwen-audio-3.0-tts-plus-loongjameszhao`
+(English news-anchor male).
 
 - Base voices use the full name `qwen-audio-3.0-tts-plus-<suffix>` (597 exist; only ~8 are English).
 - System voices use short names, e.g. `longanlingxin` (F, ZH+EN) and `longanlufeng` (M, ZH+EN).
@@ -237,7 +237,7 @@ extension (unknown extensions are sent as `wav`).
 | Container/process exits at startup with `Invalid configuration` | A required env var is missing or invalid — each problem is listed in the log; fix `.env` (all variables are required, no code defaults) |
 | `401 InvalidApiKey` from upstream | Key does not match the configured `ALI_TTS_URL`/`ALI_STT_URL` host (e.g. key issued for a different region/deployment) |
 | `404` on TTS/STT | Requested model not available for your account/region |
-| `400 'model' is required` | OpenAI spec requires `model` in every request — add it to the JSON body (TTS) or form (STT) |
+| `400 'model'/'voice' is required` | OpenAI spec requires `model` in every request and `voice` for TTS — add them to the JSON body (TTS) or form (STT) |
 | `[cosyvoice:] Engine error [411]` | Voice does not belong to the requested model — see [Voices](#voices) |
 | `413 Audio too large` | Upload exceeds `MAX_BASE64_BYTES` (ASR limit: 10 MB / 5 min) |
 | Empty `{"text": ""}` | Silent/unintelligible audio, or wrong `language` hint |

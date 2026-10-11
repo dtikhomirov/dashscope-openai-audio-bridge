@@ -81,7 +81,6 @@ class Settings:
         self.bridge_port = as_int("BRIDGE_PORT", 1, 65535)
         self.ali_tts_url = as_url("ALI_TTS_URL")
         self.ali_stt_url = as_url("ALI_STT_URL")
-        self.tts_voice = raw("TTS_VOICE")
         self.tts_format = raw("TTS_FORMAT")
         self.tts_sample_rate = as_int("TTS_SAMPLE_RATE", 1000, 192000)
         self.request_timeout = as_positive_float("REQUEST_TIMEOUT")
@@ -157,7 +156,6 @@ async def health():
     log.debug("Health check requested")
     return {
         "status": "ok",
-        "tts_voice": settings.tts_voice,
         "api_key": mask_key(settings.ali_api_key),
     }
 
@@ -172,14 +170,18 @@ async def openai_tts(payload: dict):
         log.warning("TTS rejected: request body has no non-empty 'input' string")
         raise HTTPException(status_code=400, detail="'input' text is required")
 
-    # OpenAI spec: 'model' is a required field of POST /v1/audio/speech
+    # OpenAI spec: 'model' and 'voice' are required fields of POST /v1/audio/speech
     model = payload.get("model")
     if not isinstance(model, str) or not model.strip():
         log.warning("TTS rejected: request body has no non-empty 'model' string")
         raise HTTPException(status_code=400, detail="'model' is required")
     model = model.strip()
 
-    voice = payload.get("voice") or settings.tts_voice
+    voice = payload.get("voice")
+    if not isinstance(voice, str) or not voice.strip():
+        log.warning("TTS rejected: request body has no non-empty 'voice' string")
+        raise HTTPException(status_code=400, detail="'voice' is required")
+    voice = voice.strip()
     fmt = payload.get("response_format") or settings.tts_format
     try:
         sample_rate = int(payload.get("sample_rate") or settings.tts_sample_rate)
@@ -339,9 +341,9 @@ if __name__ == "__main__":
     import uvicorn
 
     log.info(
-        "Starting bridge on %s:%s | TTS defaults: voice %s, %s @ %s Hz | key %s",
+        "Starting bridge on %s:%s | TTS defaults: %s @ %s Hz | key %s",
         settings.bridge_host, settings.bridge_port,
-        settings.tts_voice, settings.tts_format, settings.tts_sample_rate,
+        settings.tts_format, settings.tts_sample_rate,
         mask_key(settings.ali_api_key),
     )
     uvicorn.run(app, host=settings.bridge_host, port=settings.bridge_port)
