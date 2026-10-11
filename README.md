@@ -78,7 +78,8 @@ _Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptio
 ### Request flow
 
 1. **TTS** — the client sends OpenAI-style JSON (required `model`/`voice`/`input`, optional `response_format`/`sample_rate`).
-   The bridge calls the DashScope synthesizer (voice/format go **inside `input`**), receives a temporary
+   The bridge normalizes the text (strips markdown, bullets, emoji and hard line breaks that
+   cause audible pauses — see [Smooth speech](#smooth-speech)), calls the DashScope synthesizer (voice/format go **inside `input`**), receives a temporary
    download URL (`output.audio.url`, valid 24 h), fetches the audio, and streams the bytes back with the
    proper `Content-Type`.
 2. **STT** — the client uploads an audio file (multipart). The bridge base64-encodes it as a
@@ -223,11 +224,31 @@ Docs: [voice list (EN)](https://www.alibabacloud.com/help/en/model-studio/qwen-a
 `wav`, `mp3`, `aac`, `amr`, `flac`, `m4a`, `ogg`, `opus`, `wma` — detected from the file
 extension (unknown extensions are sent as `wav`).
 
+## Smooth speech
+
+TTS models insert audible pauses or stumbles at markdown decorations (`#`, `**`, `-` bullets),
+emoji, hard line breaks and unit symbols — all common in LLM output such as weather forecasts.
+Measured on a real forecast sample (~30 s of speech): ~15–20 internal pauses (≥ 250 ms) raw
+vs. typically ~6–12 after cleanup. (Synthesis is stochastic — exact counts vary per run.)
+
+The bridge therefore normalizes every `input` before synthesis:
+
+- strips emoji, markdown marks and bullet prefixes (`-`, `*`, `1.`, `>`, …)
+- converts line breaks into sentence breaks (or spaces after punctuation)
+- expands `°C`/`°F` → "degrees Celsius/Fahrenheit" and `N%` → "N percent"
+- collapses whitespace and fixes punctuation spacing
+
+Plain prose passes through unchanged. For best results also send speakable text from your
+client: prefer words over symbols ("23 degrees" not "23°", "10 to 15 kilometers per hour"
+not "10–15 km/h") and keep sentences short.
+
 ## Differences from the real OpenAI API
 
 - No streaming responses (`stream=true` is ignored); TTS returns the whole audio body.
 - `transcriptions` supports `verbose_json`/`srt`/`vtt` response formats: not implemented — always `{"text": ...}`.
 - No `speed`/`instructions`/`prompt` parameters; `temperature` is ignored.
+- TTS `input` text is normalized before synthesis (see [Smooth speech](#smooth-speech)) — a
+  deliberate extension; the real OpenAI API speaks the text verbatim.
 - No inbound authentication — keep the bridge on a trusted network.
 
 ## Troubleshooting
@@ -241,6 +262,7 @@ extension (unknown extensions are sent as `wav`).
 | `[cosyvoice:] Engine error [411]` | Voice does not belong to the requested model — see [Voices](#voices) |
 | `413 Audio too large` | Upload exceeds `MAX_BASE64_BYTES` (ASR limit: 10 MB / 5 min) |
 | Empty `{"text": ""}` | Silent/unintelligible audio, or wrong `language` hint |
+| Short pauses/breaks in TTS audio | Text artifacts, not transport — the bridge already strips markdown/emoji/newlines; send plain prose and spelled-out units (see [Smooth speech](#smooth-speech)) |
 
 ## Development
 

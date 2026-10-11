@@ -14,6 +14,7 @@ invalid.
 import base64
 import logging
 import os
+import re
 from pathlib import Path
 
 import requests
@@ -127,6 +128,33 @@ def auth_headers() -> dict:
     }
 
 
+EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u2B00-\u2BFF\u2190-\u21FF]")
+BULLET_RE = re.compile(r"^[ \t]*(?:[-*+\u2022\u00b7>]+|\d+\.)[ \t]+", re.M)
+MARKDOWN_RE = re.compile(r"[#*_>`|~]+")
+
+
+def normalize_tts_text(text: str) -> str:
+    """Make text speakable: the synthesizer inserts audible pauses or stumbles at
+    markdown decorations, bullets, emoji and hard line breaks (common in LLM output
+    like weather forecasts). Strip those and expand a few unit symbols."""
+    text = EMOJI_RE.sub(" ", text)
+    text = BULLET_RE.sub(" ", text)
+    text = MARKDOWN_RE.sub(" ", text)
+
+    def newline_to_break(m: re.Match) -> str:
+        prev = text[m.start() - 1] if m.start() else ""
+        return " " if prev in ".!?,;:" else ". "
+
+    text = re.sub(r"\r?\n+", newline_to_break, text)
+    text = text.replace("\u00b0C", " degrees Celsius").replace("\u00b0F", " degrees Fahrenheit")
+    text = re.sub(r"(\d+)\s*%", r"\1 percent", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"(?<=[.!?,;:])\s*\.", "", text)  # collapse ". ." duplicates
+    text = re.sub(r"\s+([.,!?;:])", r"\1", text)    # no space before punctuation
+    text = re.sub(r"\(\s+", "(", text).replace(" )", ")")
+    return text.strip()
+
+
 def extract_asr_text(output: dict) -> str:
     """Pull recognized text out of the DashScope ASR response (several shapes seen in the wild)."""
     sentences = output.get("sentences")
@@ -169,6 +197,14 @@ async def openai_tts(payload: dict):
     if not isinstance(text, str) or not text.strip():
         log.warning("TTS rejected: request body has no non-empty 'input' string")
         raise HTTPException(status_code=400, detail="'input' text is required")
+
+    spoken = normalize_tts_text(text)
+    if not spoken:
+        log.warning("TTS rejected: 'input' contains no speakable text after normalization")
+        raise HTTPException(status_code=400, detail="'input' contains no speakable text")
+    if len(spoken) != len(text):
+        log.debug("TTS text normalized: %d -> %d chars", len(text), len(spoken))
+    text = spoken
 
     # OpenAI spec: 'model' and 'voice' are required fields of POST /v1/audio/speech
     model = payload.get("model")
