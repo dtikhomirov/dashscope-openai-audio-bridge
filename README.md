@@ -1,5 +1,7 @@
 # DashScope ↔ OpenAI Audio Bridge
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A lightweight FastAPI service that exposes **OpenAI-compatible audio endpoints** backed by
 [Alibaba Cloud Model Studio (DashScope)](https://www.alibabacloud.com/help/en/model-studio/)
 Qwen-Audio models. Works with any DashScope deployment — mainland China, International, or
