@@ -81,11 +81,9 @@ class Settings:
         self.bridge_port = as_int("BRIDGE_PORT", 1, 65535)
         self.ali_tts_url = as_url("ALI_TTS_URL")
         self.ali_stt_url = as_url("ALI_STT_URL")
-        self.tts_model = raw("TTS_MODEL")
         self.tts_voice = raw("TTS_VOICE")
         self.tts_format = raw("TTS_FORMAT")
         self.tts_sample_rate = as_int("TTS_SAMPLE_RATE", 1000, 192000)
-        self.stt_model = raw("STT_MODEL")
         self.request_timeout = as_positive_float("REQUEST_TIMEOUT")
         self.max_base64_bytes = as_int("MAX_BASE64_BYTES", 1, 100 * 1024 * 1024)
 
@@ -159,8 +157,6 @@ async def health():
     log.debug("Health check requested")
     return {
         "status": "ok",
-        "tts_model": settings.tts_model,
-        "stt_model": settings.stt_model,
         "tts_voice": settings.tts_voice,
         "api_key": mask_key(settings.ali_api_key),
     }
@@ -176,7 +172,13 @@ async def openai_tts(payload: dict):
         log.warning("TTS rejected: request body has no non-empty 'input' string")
         raise HTTPException(status_code=400, detail="'input' text is required")
 
-    model = payload.get("model") or settings.tts_model
+    # OpenAI spec: 'model' is a required field of POST /v1/audio/speech
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.strip():
+        log.warning("TTS rejected: request body has no non-empty 'model' string")
+        raise HTTPException(status_code=400, detail="'model' is required")
+    model = model.strip()
+
     voice = payload.get("voice") or settings.tts_voice
     fmt = payload.get("response_format") or settings.tts_format
     try:
@@ -250,7 +252,11 @@ async def openai_transcriptions(
     model: str = Form(None),
     language: str = Form(None),
 ):
-    model = model or settings.stt_model
+    # OpenAI spec: 'model' is a required field of POST /v1/audio/transcriptions
+    if not model or not model.strip():
+        log.warning("STT rejected: multipart form has no non-empty 'model' field")
+        raise HTTPException(status_code=400, detail="'model' form field is required")
+    model = model.strip()
 
     content = await file.read()
     if not content:
@@ -333,9 +339,9 @@ if __name__ == "__main__":
     import uvicorn
 
     log.info(
-        "Starting bridge on %s:%s | TTS %s (voice %s, %s @ %s Hz) | STT %s | key %s",
+        "Starting bridge on %s:%s | TTS defaults: voice %s, %s @ %s Hz | key %s",
         settings.bridge_host, settings.bridge_port,
-        settings.tts_model, settings.tts_voice, settings.tts_format, settings.tts_sample_rate,
-        settings.stt_model, mask_key(settings.ali_api_key),
+        settings.tts_voice, settings.tts_format, settings.tts_sample_rate,
+        mask_key(settings.ali_api_key),
     )
     uvicorn.run(app, host=settings.bridge_host, port=settings.bridge_port)
