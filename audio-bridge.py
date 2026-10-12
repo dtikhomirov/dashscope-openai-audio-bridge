@@ -12,9 +12,13 @@ invalid.
 """
 
 import base64
+import io
 import logging
+import math
 import os
 import re
+import wave
+from array import array
 from pathlib import Path
 
 import requests
@@ -86,6 +90,9 @@ class Settings:
         self.tts_sample_rate = as_int("TTS_SAMPLE_RATE", 1000, 192000)
         self.request_timeout = as_positive_float("REQUEST_TIMEOUT")
         self.max_base64_bytes = as_int("MAX_BASE64_BYTES", 1, 100 * 1024 * 1024)
+        # 0 disables silence smoothing; otherwise internal silences in TTS audio
+        # longer than this cap are shortened (wav/pcm responses only).
+        self.tts_silence_cap_ms = as_int("TTS_SILENCE_CAP_MS", 0, 10000)
 
         log_level = raw("LOG_LEVEL").upper()
         if log_level and log_level not in VALID_LOG_LEVELS:
@@ -131,15 +138,31 @@ def auth_headers() -> dict:
 EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u2B00-\u2BFF\u2190-\u21FF]")
 BULLET_RE = re.compile(r"^[ \t]*(?:[-*+\u2022\u00b7>]+|\d+\.)[ \t]+", re.M)
 MARKDOWN_RE = re.compile(r"[#*_>`|~]+")
+# Numeric ranges like "10-15" or "10–15": spoken as "10 to 15" because the
+# synthesizer inserts a comma pause at hyphen/space-grouped digit strings
+# (documented in the SSML <say-as> reference). Guards exclude dates (2026-01-15)
+# and longer digit strings (phone numbers).
+NUM_RANGE_RE = re.compile(r"(?<![\d.\-\u2013\u2014])(\d{1,3})\s*[-\u2013\u2014]\s*(\d{1,3})(?![\d.\-\u2013\u2014])")
+TILDE_RANGE_RE = re.compile(r"(?<=\w)\s*~\s*(?=\w)")
+UNIT_WORDS = (
+    (re.compile(r"\bkm/h\b", re.I), " kilometers per hour"),
+    (re.compile(r"\bmph\b", re.I), " miles per hour"),
+    (re.compile(r"\bm/s\b"), " meters per second"),
+)
 
 
 def normalize_tts_text(text: str) -> str:
     """Make text speakable: the synthesizer inserts audible pauses or stumbles at
-    markdown decorations, bullets, emoji and hard line breaks (common in LLM output
-    like weather forecasts). Strip those and expand a few unit symbols."""
+    markdown decorations, bullets, emoji, hard line breaks, dashes and unit symbols
+    (common in LLM output like weather forecasts). Strip those, verbalize numeric
+    ranges and expand a few unit symbols."""
     text = EMOJI_RE.sub(" ", text)
     text = BULLET_RE.sub(" ", text)
+    text = TILDE_RANGE_RE.sub(" to ", text)  # before MARKDOWN_RE strips "~"
+    text = NUM_RANGE_RE.sub(r"\1 to \2", text)
     text = MARKDOWN_RE.sub(" ", text)
+    text = text.replace("\u2013", " ").replace("\u2014", " ")  # en/em dashes
+    text = text.replace("\u2026", ".").replace("...", ".")
 
     def newline_to_break(m: re.Match) -> str:
         prev = text[m.start() - 1] if m.start() else ""
@@ -148,11 +171,120 @@ def normalize_tts_text(text: str) -> str:
     text = re.sub(r"\r?\n+", newline_to_break, text)
     text = text.replace("\u00b0C", " degrees Celsius").replace("\u00b0F", " degrees Fahrenheit")
     text = re.sub(r"(\d+)\s*%", r"\1 percent", text)
+    for pattern, words in UNIT_WORDS:
+        text = pattern.sub(words, text)
+    text = text.replace(";", ",")  # semicolons trigger long prosodic pauses
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"(?<=[.!?,;:])\s*\.", "", text)  # collapse ". ." duplicates
     text = re.sub(r"\s+([.,!?;:])", r"\1", text)    # no space before punctuation
     text = re.sub(r"\(\s+", "(", text).replace(" )", ")")
     return text.strip()
+
+
+# ---------------------------------------------------------
+# Silence smoothing: the CosyVoice engine behind Qwen-Audio-TTS inserts
+# stochastic prosodic silences (250-900 ms) at punctuation that no upstream
+# parameter removes (see docs/qwen-audio-tts-reference.md). The maintainer-
+# endorsed fix is postprocessing: detect long internal silences and shorten
+# them. Applied to wav/pcm responses only; compressed formats pass through.
+# ---------------------------------------------------------
+SILENCE_RMS_THRESHOLD = 300   # 16-bit mono frames quieter than this count as silence
+SILENCE_FRAME_MS = 10
+CROSSFADE_MS = 4              # short fades at each cut to avoid clicks
+
+
+def _silence_mask(samples: array, sample_rate: int) -> list:
+    """Per-frame (10 ms) boolean: True where the frame is silence."""
+    frame = max(1, sample_rate * SILENCE_FRAME_MS // 1000)
+    mask = []
+    for i in range(0, len(samples), frame):
+        chunk = samples[i:i + frame]
+        rms = math.sqrt(sum(s * s for s in chunk) / len(chunk))
+        mask.append(rms < SILENCE_RMS_THRESHOLD)
+    return mask
+
+
+def compress_silence(samples: array, sample_rate: int, cap_ms: int) -> array:
+    """Shorten every silence longer than cap_ms to cap_ms (leading/trailing
+    included), splicing regions with a short crossfade. Returns new samples."""
+    if not len(samples):
+        return samples
+    mask = _silence_mask(samples, sample_rate)
+    frame = max(1, sample_rate * SILENCE_FRAME_MS // 1000)
+    cap_frames = max(1, cap_ms // SILENCE_FRAME_MS)
+
+    # Group kept frames into contiguous regions
+    regions = []  # (start_sample, end_sample)
+    run = 0
+    start = None
+    for idx, silent in enumerate(mask):
+        if silent:
+            run += 1
+            keep = run <= cap_frames
+        else:
+            run = 0
+            keep = True
+        if keep and start is None:
+            start = idx
+        elif not keep and start is not None:
+            regions.append((start * frame, min(idx * frame, len(samples))))
+            start = None
+    if start is not None:
+        regions.append((start * frame, len(samples)))
+
+    if len(regions) <= 1:
+        return samples
+
+    fade = max(1, sample_rate * CROSSFADE_MS // 1000)
+    out = array("h")
+    for n, (a, b) in enumerate(regions):
+        piece = array("h", samples[a:b])
+        if n > 0:  # fade in at the cut
+            for i in range(min(fade, len(piece))):
+                piece[i] = int(piece[i] * i / fade)
+        if n < len(regions) - 1:  # fade out into the cut
+            for i in range(min(fade, len(piece))):
+                piece[len(piece) - 1 - i] = int(piece[len(piece) - 1 - i] * i / fade)
+        out.extend(piece)
+    return out
+
+
+def smooth_tts_audio(content: bytes, fmt: str, sample_rate: int, cap_ms: int) -> bytes:
+    """Apply silence compression to a synthesized wav/pcm body. Returns the
+    original bytes unchanged for compressed formats or unexpected layouts."""
+    try:
+        if fmt == "wav":
+            with wave.open(io.BytesIO(content)) as w:
+                if w.getnchannels() != 1 or w.getsampwidth() != 2:
+                    return content
+                rate = w.getframerate()
+                # WAV header duration is documented as an estimate - read to EOF
+                frames = w.readframes(2 ** 30)
+            samples = array("h")
+            samples.frombytes(frames[: len(frames) // 2 * 2])
+        elif fmt == "pcm":
+            rate = sample_rate
+            samples = array("h")
+            samples.frombytes(content[: len(content) // 2 * 2])
+        else:
+            return content
+
+        smoothed = compress_silence(samples, rate, cap_ms)
+        if len(smoothed) == len(samples):
+            return content
+
+        if fmt == "pcm":
+            return smoothed.tobytes()
+        out = io.BytesIO()
+        with wave.open(out, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(smoothed.tobytes())
+        return out.getvalue()
+    except (wave.Error, EOFError, ValueError) as exc:
+        log.warning("Silence smoothing skipped (%s) - returning audio unchanged", exc)
+        return content
 
 
 def extract_asr_text(output: dict) -> str:
@@ -225,21 +357,36 @@ async def openai_tts(payload: dict):
         log.warning("TTS rejected: invalid sample_rate %r in request", payload.get("sample_rate"))
         raise HTTPException(status_code=400, detail="sample_rate must be an integer")
 
+    # OpenAI 'speed' (0.25-4.0) maps to the upstream 'rate' parameter (0.5-2.0).
+    # A slightly elevated rate also measurably shortens prosodic pauses.
+    rate = None
+    speed = payload.get("speed")
+    if speed is not None:
+        try:
+            speed = float(speed)
+        except (TypeError, ValueError):
+            log.warning("TTS rejected: invalid speed %r in request", payload.get("speed"))
+            raise HTTPException(status_code=400, detail="speed must be a number")
+        if not 0.25 <= speed <= 4.0:
+            log.warning("TTS rejected: speed %r out of OpenAI range 0.25-4.0", speed)
+            raise HTTPException(status_code=400, detail="speed must be between 0.25 and 4.0")
+        rate = min(2.0, max(0.5, speed))
+
     log.info(
-        "TTS request: model=%s voice=%s format=%s sample_rate=%s text_chars=%d",
-        model, voice, fmt, sample_rate, len(text),
+        "TTS request: model=%s voice=%s format=%s sample_rate=%s speed=%s text_chars=%d",
+        model, voice, fmt, sample_rate, speed if speed is not None else "-", len(text),
     )
 
     # qwen-audio-3.0-tts takes voice/format/sample_rate inside "input"
-    ali_payload = {
-        "model": model,
-        "input": {
-            "text": text,
-            "voice": voice,
-            "format": fmt,
-            "sample_rate": sample_rate,
-        },
+    ali_input = {
+        "text": text,
+        "voice": voice,
+        "format": fmt,
+        "sample_rate": sample_rate,
     }
+    if rate is not None:
+        ali_input["rate"] = rate
+    ali_payload = {"model": model, "input": ali_input}
 
     try:
         resp = requests.post(
@@ -275,6 +422,15 @@ async def openai_tts(payload: dict):
     else:
         log.error("TTS upstream response contained no audio: %s", str(data)[:500])
         raise HTTPException(status_code=502, detail=f"No audio in DashScope response: {data}")
+
+    if settings.tts_silence_cap_ms > 0:
+        smoothed = smooth_tts_audio(content, fmt, sample_rate, settings.tts_silence_cap_ms)
+        if smoothed is not content:
+            log.info(
+                "Silence smoothing: %d -> %d bytes (cap %d ms)",
+                len(content), len(smoothed), settings.tts_silence_cap_ms,
+            )
+            content = smoothed
 
     media_type = "audio/mpeg" if fmt == "mp3" else f"audio/{fmt}"
     log.info("TTS success: returned %d bytes of %s", len(content), media_type)

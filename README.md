@@ -181,12 +181,14 @@ per problem and exits with code `2` instead of serving a misconfigured API.
 | `TTS_SAMPLE_RATE` | `24000` | Output sample rate in Hz (1000–192000) |
 | `REQUEST_TIMEOUT` | `120` | Upstream HTTP timeout in seconds (> 0) |
 | `MAX_BASE64_BYTES` | `10485760` | Max base64-encoded upload size for ASR (API limit: 10 MB) |
+| `TTS_SILENCE_CAP_MS` | `250` | Cap for internal silences in wav/pcm TTS output, in ms; `0` disables smoothing (0–10000) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 
 Per the OpenAI spec, `model` is **required in every request** (JSON body for TTS, multipart
 form for STT) and `voice` is **required for TTS**; they select the DashScope model and voice
 to call. Optional per-request overrides with env defaults (TTS only): `response_format`,
-`sample_rate`; STT accepts an optional `language` hint.
+`sample_rate`; `speed` is forwarded as the upstream `rate`. STT accepts an optional
+`language` hint.
 
 ## Logging
 
@@ -236,14 +238,28 @@ The bridge therefore normalizes every `input` before synthesis:
 
 - strips emoji, markdown marks and bullet prefixes (`-`, `*`, `1.`, `>`, …)
 - converts line breaks into sentence breaks (or spaces after punctuation)
-- expands `°C`/`°F` → "degrees Celsius/Fahrenheit" and `N%` → "N percent"
-- collapses whitespace and fixes punctuation spacing
+- verbalizes numeric ranges (`10-15` → "10 to 15"; dates and phone numbers are left alone)
+- expands units: `°C`/`°F`, `N%`, `km/h`, `mph`, `m/s`
+- replaces dashes (`–`, `—`), ellipses and semicolons with lighter punctuation
 
 Plain prose passes through unchanged. For best results also send speakable text from your
-client: prefer words over symbols ("23 degrees" not "23°", "10 to 15 kilometers per hour"
-not "10–15 km/h") and keep sentences short.
+client: prefer words over symbols ("23 degrees" not "23°") and keep sentences short.
 
-The upstream synthesizer exposes further quality parameters (`rate`, `pitch`, `volume`,
+### Silence smoothing
+
+Even with clean text the CosyVoice engine behind Qwen-Audio-TTS inserts stochastic prosodic
+silences (250–900 ms) at punctuation — no upstream parameter removes them (SSML `<break>`,
+`language_hints` and `instruction` were all measured to make pauses worse or no better). The
+maintainer-recommended fix is postprocessing, so the bridge shortens every internal silence
+longer than `TTS_SILENCE_CAP_MS` (default recommendation: `250`; `0` disables) in `wav`/`pcm`
+responses, with a 4 ms crossfade at each cut. Compressed formats (`mp3`, `opus`, …) pass
+through untouched. Measured on a forecast sample: pauses capped from up to 990 ms to a
+uniform 250 ms with speech fully intelligible (verified by ASR roundtrip).
+
+Additionally, the OpenAI `speed` parameter is forwarded as the upstream `rate` (clamped to
+the supported 0.5–2.0); values around 1.15–1.25 measurably shorten prosodic pauses.
+
+The upstream synthesizer exposes further quality parameters (`pitch`, `volume`,
 `language_hints`, `hot_fix`, `instruction`, SSML, …) that the bridge does not forward yet —
 see [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md) for the full
 parameter and limits reference with official documentation links.
@@ -252,7 +268,8 @@ parameter and limits reference with official documentation links.
 
 - No streaming responses (`stream=true` is ignored); TTS returns the whole audio body.
 - `transcriptions` supports `verbose_json`/`srt`/`vtt` response formats: not implemented — always `{"text": ...}`.
-- No `speed`/`instructions`/`prompt` parameters; `temperature` is ignored.
+- `speed` is forwarded as the upstream `rate`, clamped to 0.5–2.0 (upstream limit);
+  `instructions`/`prompt` are not supported; `temperature` is ignored.
 - TTS `input` text is normalized before synthesis (see [Smooth speech](#smooth-speech)) — a
   deliberate extension; the real OpenAI API speaks the text verbatim.
 - No inbound authentication — keep the bridge on a trusted network.
@@ -268,7 +285,7 @@ parameter and limits reference with official documentation links.
 | `[cosyvoice:] Engine error [411]` | Voice does not belong to the requested model — see [Voices](#voices) |
 | `413 Audio too large` | Upload exceeds `MAX_BASE64_BYTES` (ASR limit: 10 MB / 5 min) |
 | Empty `{"text": ""}` | Silent/unintelligible audio, or wrong `language` hint |
-| Short pauses/breaks in TTS audio | Text artifacts, not transport — the bridge already strips markdown/emoji/newlines; send plain prose and spelled-out units (see [Smooth speech](#smooth-speech)) |
+| Short pauses/breaks in TTS audio | The engine inserts stochastic prosodic silences at punctuation (not transport). The bridge normalizes text and caps silences at `TTS_SILENCE_CAP_MS` for wav/pcm — see [Smooth speech](#smooth-speech). Try `speed` ≈ 1.15–1.25 or a different voice |
 
 ## Development
 
