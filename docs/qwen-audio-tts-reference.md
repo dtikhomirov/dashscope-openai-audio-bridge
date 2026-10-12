@@ -1,162 +1,182 @@
-# Qwen-Audio-TTS parameter & limits reference
+# Qwen-Audio-TTS parameters and limits
 
-Research notes for this bridge, compiled **2026-10-12** from official Alibaba Cloud
-Model Studio documentation plus ~30 live probes against the exact endpoint this
-bridge uses. Everything marked *verified* was confirmed empirically on:
+This article describes the request parameters, service limits, response fields, and
+voice catalog for the Qwen-Audio-TTS speech synthesis models in Alibaba Cloud Model
+Studio, with a focus on `qwen-audio-3.0-tts-plus` — the model this bridge calls over
+the HTTP `SpeechSynthesizer` endpoint. All values are quoted from the official
+documentation listed in [References](#references).
 
-- **Endpoint**: `https://token-plan.ap-southeast-1.maas.aliyuncs.com/api/v1/services/audio/tts/SpeechSynthesizer` (HTTP, non-streaming)
-- **Model**: `qwen-audio-3.0-tts-plus`
-- **Voice**: `qwen-audio-3.0-tts-plus-loongjameszhao`
-- **Engine**: CosyVoice (revealed by error message prefixes, e.g. `[cosyvoice]Engine error [421]`)
+> [!NOTE]
+> The primary parameter reference for Qwen-Audio-TTS documents the real-time
+> (WebSocket / AOQ) API, where synthesis parameters are sent in the
+> `payload.parameters` object of the `run-task` event and text is sent through
+> `continue-task` events. The HTTP `SpeechSynthesizer` endpoint used by this bridge
+> accepts the same parameter names. The bridge currently forwards `text`, `voice`,
+> `format`, and `sample_rate` inside the `input` object of each request.
 
-## TL;DR for agents
+## Request parameters
 
-- Quality knobs live **inside `input`** of the HTTP payload (same names as the
-  WebSocket `parameters` object): `rate`, `volume`, `pitch`, `language_hints`,
-  `hot_fix`, `instruction`, `enable_ssml`, `seed`, `bit_rate`, `text_type`,
-  `word_timestamp_enabled`.
-- The three levers that matter for smoother speech: `rate` ≈ 1.05–1.15,
-  `language_hints: ["en"]`, and `hot_fix.replace` for surgical word swaps.
-- `seed` is accepted but **not** deterministic on this endpoint — do not rely on it.
-- The practical length ceiling is the bridge's `REQUEST_TIMEOUT` (120 s),
-  **not** a character limit: ≈31 chars of text produced ≈2.8 s of audio, so
-  ~1,300–1,500 spoken characters fit in one non-streaming request. The documented
-  per-message cap is 20,000 characters.
-- The widely quoted **600-character** limit applies to `qwen3-tts-flash` on the
-  *multimodal-generation* endpoint — a different API family. It does **not**
-  apply here.
+The following parameters are documented for Qwen-Audio-TTS speech synthesis tasks.
 
-## Verified parameter table (HTTP endpoint, all inside `input`)
+| Parameter | Type | Required | Default value | Valid values | Description |
+|---|---|---|---|---|---|
+| `model` | string | Yes | — | `qwen-audio-3.0-tts-plus`, `qwen-audio-3.0-tts-flash`, `qwen-audio-3.1-tts-flash` | The model name. |
+| `text` | string | Yes | — | Maximum 20,000 characters per message and 200,000 characters cumulatively | The text to synthesize. Supports multilingual mixed input. |
+| `text_type` | string | Yes (WebSocket API) | — | `PlainText` | The type of the input text. |
+| `voice` | string | Yes | — | See [Voices](#voices) | The voice used for speech synthesis. Voice IDs are case-sensitive and scoped to a model. System voices, cloned voices, and designed voices are supported. |
+| `format` | string | No | `mp3` | `pcm`, `wav`, `mp3`, `opus` | The audio encoding format. |
+| `sample_rate` | integer | No | `22050` | `8000`, `16000`, `22050`, `24000`, `44100`, `48000` | The audio sample rate, in hertz (Hz). |
+| `volume` | integer | No | `50` | `0`–`100` | The volume level. |
+| `rate` | float | No | `1.0` | `0.5`–`2.0` | The speech rate. |
+| `pitch` | float | No | `1.0` | `0.5`–`2.0` | The pitch of the synthesized speech. |
+| `bit_rate` | integer | No | `32` | `6`–`510` | The audio bit rate, in kilobits per second (kbps). Applies only to the `mp3` and `opus` formats. |
+| `language_hints` | array[string] | No | Automatic detection | `zh`, `en`, `fr`, `de`, `ja`, `ko`, `ru`, `pt`, `th`, `id`, `vi`, `es`, `it`, `ms`, `fil`, `ar` | The target language for synthesis. Specifying the language improves synthesis quality and corrects digit pronunciation, abbreviation expansion, and symbol reading. The current version processes only the first element of the array. |
+| `instruction` | string | No | — | Free text | An instruction that controls dialect, emotion, or voice character during synthesis. |
+| `hot_fix` | object | No | — | See below | Pronunciation corrections and text replacements applied before synthesis. |
+| `enable_ssml` | boolean | No | `false` | `true`, `false` | Specifies whether to enable SSML. When set to `true`, only one text message is allowed per task. For supported models and voices, see the SSML limitations reference. |
+| `word_timestamp_enabled` | boolean | No | `false` | `true`, `false` | Specifies whether to enable word-level timestamps. Available only in streaming output mode. Cloned voices are supported; for system voices, see the voice list. |
+| `seed` | integer | No | `0` | `0`–`65535` | A random seed for controlling variation in the synthesis output. Per the documentation, when the model version, text, voice, and other parameters are unchanged, the same seed produces identical results. |
+| `enable_aigc_tag` | boolean | No | `false` | `true`, `false` | Specifies whether to embed an AIGC watermark in generated audio files of supported formats (`wav`, `mp3`, `opus`). |
+| `aigc_propagator` | string | No | Alibaba Cloud UID | — | Sets the `ContentPropagator` field in the AIGC watermark. Takes effect only when `enable_aigc_tag` is `true`. |
+| `aigc_propagate_id` | string | No | The request ID | — | Sets the `PropagateID` field in the AIGC watermark. Takes effect only when `enable_aigc_tag` is `true`. |
 
-| Parameter | Type | Valid values / range | Verified effect | Notes |
-|---|---|---|---|---|
-| `text` | string | ≤ 20,000 chars per message (docs) | — | 5,000 chars accepted empirically |
-| `voice` | string | required | — | See [Voices](#voices-supported-by-qwen-audio-30-tts-plus) below; base voices are named `qwen-audio-3.0-tts-plus-<suffix>` |
-| `format` | string | `pcm`, `wav`, `mp3` (default), `opus` | `flac` → 400 "Request format is invalid!" | |
-| `sample_rate` | int | docs: 8000/16000/22050 (default)/24000/44100/48000 | **arbitrary values honored** — 12345 Hz produced a WAV whose header says 12345 | endpoint is laxer than docs |
-| `rate` | float | **0.5–2.0** (0.4 / 2.1 / 5.0 → 400 err 421) | 0.6 → 4.40 s, 1.0 → 2.80 s, 1.8 → 1.38 s for identical text | speech speed |
-| `volume` | int | **0–100** (150 → 400) | RMS 515 / 2100 / 4755 at 10 / 50 (default) / 100 | loudness |
-| `pitch` | float | **0.5–2.0** (2.5 → 400 err 422) | zero-crossing rate 1778 Hz @0.6 vs 3859 Hz @1.8 (baseline ~2700–3000) | also perturbs duration |
-| `language_hints` | array[string] | `zh en fr de ja ko ru pt th id vi es it ms fil ar` | `["zh"]` on English text changed output (2.08 s vs 2.80 s); `["en"]` was byte-identical to baseline | only first element processed; docs: fixes digit/symbol/abbreviation pronunciation |
-| `hot_fix` | object | `{replace: [{from: to}], pronunciation: {word: pinyin}}` | **STT-proven**: `replace [{"test":"banana"}]` → ASR transcribed "banana" | text replacement + pinyin correction before synthesis |
-| `instruction` | string | free text | accepted (200); effect is voice-dependent | dialect/emotion/character control; err 423 "Voice does not support emotion" exists for emotion tags |
-| `enable_ssml` | bool | default `false` | accepted (200) with plain text | when true only one text chunk allowed (WS); voice/model restrictions apply |
-| `seed` | int | 0–65535 | accepted but **NOT deterministic**: two identical `seed=42` requests → different audio (2.64 s vs 2.96 s) | identical payloads *without* seed are occasionally byte-identical (replica-dependent) |
-| `word_timestamp_enabled` | bool | default `false` | accepted; no timestamps in non-streaming HTTP response | docs: streaming output only |
-| `bit_rate` | int | 6–510 kbps (mp3/opus only) | `bit_rate=128` measurably changed mp3 size (41.9 KB vs 57.2 KB default for same text) | docs default 32 |
-| `text_type` | string | `PlainText` | byte-identical to omitting | |
-| `enable_aigc_tag` (+`aigc_propagator`, `aigc_propagate_id`) | bool/string | default `false` | not probed | embeds AIGC watermark in wav/mp3/opus |
+The `hot_fix` object supports two fields:
 
-## Voices supported by `qwen-audio-3.0-tts-plus`
+- `pronunciation`: custom pinyin annotations for words whose default pronunciation is
+  inaccurate — for example, `{"weather": "tian1 qi4"}`.
+- `replace`: text replacements applied before synthesis — for example,
+  `{"today": "gold day"}`. The replaced text is used as the actual synthesis input.
 
-Voice IDs are **case-sensitive** and **cannot be mixed across models** — a voice from
-another model (e.g. `loongmary` from `qwen-audio-3.0-tts-flash`) returns
-`[cosyvoice:] Engine error [411]: TTS speak operation failed` (verified).
+## Limits
 
-### System voices (flagship, 2)
+| Limit | Value | Applies to |
+|---|---|---|
+| Text per message | 20,000 characters | Qwen-Audio-TTS synthesis tasks |
+| Cumulative text per task | 200,000 characters | Qwen-Audio-TTS synthesis tasks |
+| Interval between text messages | 23 seconds; longer intervals time out the connection | WebSocket API |
+| Input text length | 600 characters | `qwen-tts` and `qwen3-tts-flash` on the multimodal-generation endpoint only |
+| Audio URL validity | 24 hours | `output.audio.url` in HTTP non-streaming responses |
+| Voice availability by region | Multilingual and dialect voices: Beijing and Singapore. All other voice categories: Beijing only | `qwen-audio-3.1-tts-flash` |
+| Bridge request timeout | `REQUEST_TIMEOUT` (120 seconds in `.env.example`) | This bridge; long texts may exceed the timeout before synthesis completes |
+
+> [!IMPORTANT]
+> The 600-character input limit documented in the Qwen-TTS API reference applies to
+> the `qwen-tts` / `qwen3-tts-flash` model family on the multimodal-generation
+> endpoint. It does not apply to Qwen-Audio-TTS models such as
+> `qwen-audio-3.0-tts-plus`.
+
+## Response and billing
+
+In the real-time API, the server returns `task-started`, `result-generated`, and
+`task-finished` events. Each `result-generated` event carries sentence-level metadata
+with the sub-event types `sentence-begin`, `sentence-synthesis`, and `sentence-end`.
+One audio frame is transmitted over the WebSocket binary channel immediately after
+each `sentence-synthesis` event. The `sentence-end` event returns the sentence text,
+word-level timestamps (`sentence.words`, with `begin_time` and `end_time` in
+milliseconds), and billing usage.
+
+Billing usage is reported as `usage.characters` — the number of characters in the
+input text.
+
+For HTTP non-streaming synthesis, the Qwen-TTS API reference documents the following
+response fields: `output.audio.url` (the URL of the complete audio file, valid for
+24 hours), `output.audio.expires_at`, and `output.audio.data` (base64-encoded audio;
+populated only in streaming mode).
+
+## Voices
+
+Voice IDs are case-sensitive. The selected voice must be supported by the selected
+model. Do not use voices from another model — an unsupported voice returns
+`[cosyvoice:] Engine error [411]: TTS speak operation failed`. The text must use a
+language supported by the voice; otherwise, pronunciation errors or unnatural speech
+might occur.
+
+### System voices for qwen-audio-3.0-tts-plus
 
 | Voice parameter | Name | Gender | Age | Character | Languages |
 |---|---|---|---|---|---|
-| `longanlingxin` | Long An Ling Xin | F | 25 | warm and empathetic | Chinese (Mandarin), English |
-| `longanlufeng` | Long An Lu Feng | M | 25 | bright and cheerful | Chinese (Mandarin), English |
+| `longanlingxin` | Long An Ling Xin | Female | 25 | Warm and empathetic | Chinese (Mandarin), English |
+| `longanlufeng` | Long An Lu Feng | Male | 25 | Bright and cheerful | Chinese (Mandarin), English |
 
-### Base voices (voice-cloned, 597 total)
+### Base voices for qwen-audio-3.0-tts-plus
 
-Naming pattern: `qwen-audio-3.0-tts-plus-<suffix>`. Language breakdown (from the
-official Excel list): **589 Chinese-only, 8 English**. The 8 English-capable ones:
+In addition to the system voices, `qwen-audio-3.0-tts-plus` and
+`qwen-audio-3.0-tts-flash` each provide more than 500 base voices generated through
+voice cloning. Base voices are called in the same way as system voices and follow the
+naming pattern `qwen-audio-3.0-tts-{plus|flash}-{voice suffix}`. The same suffix in
+both models maps to the same set of preview audio files.
 
-| Voice parameter | Name | Gender | Age | Character (translated) | Use case |
+The official base-voice list for `qwen-audio-3.0-tts-plus` (Excel) contains 597
+voices: 589 Chinese voices and 8 English voices. The English voices are:
+
+| Voice parameter | Name | Gender | Age | Character | Use case |
 |---|---|---|---|---|---|
-| `qwen-audio-3.0-tts-plus-loongjameszhao` | James Zhao | M | 28 | news-broadcast voice ← *used in this repo's examples* | daily conversation |
-| `qwen-audio-3.0-tts-plus-loongolivialin` | Olivia Lin | F | 28 | gentle, intellectual | emotional companionship |
-| `qwen-audio-3.0-tts-plus-loonglunawang` | Luna Wang | F | 21 | smart-assistant voice | daily conversation |
-| `qwen-audio-3.0-tts-plus-loongnorahu` | Nora Hu | F | 25 | lively, spirited | daily conversation |
-| `qwen-audio-3.0-tts-plus-loongivyhu` | Ivy Hu | F | 54 | confident, composed | speech / recitation |
-| `qwen-audio-3.0-tts-plus-loongalexanderhu` | Alexander Hu | M | 27 | retro-cassette voice | daily conversation |
-| `qwen-audio-3.0-tts-plus-loongadriangao` | Adrian Gao | M | 22 | calm, steady | audiobook reading |
-| `qwen-audio-3.0-tts-plus-loongryanma` | Ryan Ma | M | 38 | electronic / trendy | daily conversation |
+| `qwen-audio-3.0-tts-plus-loongjameszhao` | James Zhao | Male | 28 | News-broadcast voice (used in this repository's examples) | Daily conversation |
+| `qwen-audio-3.0-tts-plus-loongolivialin` | Olivia Lin | Female | 28 | Gentle, intellectual | Emotional companionship |
+| `qwen-audio-3.0-tts-plus-loonglunawang` | Luna Wang | Female | 21 | Smart-assistant voice | Daily conversation |
+| `qwen-audio-3.0-tts-plus-loongnorahu` | Nora Hu | Female | 25 | Lively, spirited | Daily conversation |
+| `qwen-audio-3.0-tts-plus-loongivyhu` | Ivy Hu | Female | 54 | Confident, composed | Speech and recitation |
+| `qwen-audio-3.0-tts-plus-loongalexanderhu` | Alexander Hu | Male | 27 | Retro-cassette voice | Daily conversation |
+| `qwen-audio-3.0-tts-plus-loongadriangao` | Adrian Gao | Male | 22 | Calm, steady | Audiobook reading |
+| `qwen-audio-3.0-tts-plus-loongryanma` | Ryan Ma | Male | 38 | Electronic, trendy | Daily conversation |
 
-The full 597-row list (Chinese name, gender, age, character, use case, preview file name)
-is in the official Excel: [qwen-audio-3.0-tts-plus base voices.xlsx](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260723/ydwqqz/qwen-audio-3.0-tts-plus%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2.xlsx)
-(columns: 序号 #, 名称 name, voice参数 voice parameter, 性别 gender, 年龄 age, 特质 character,
-适用场景 use case, 语种 language, 预览音频文件名 preview file).
-Preview audio package (shared with the flash model): [base voice preview audio package.zip](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260720/tuuuqo/%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2%E8%AF%95%E5%90%AC%E9%9F%B3%E9%A2%91%E5%8C%85.zip).
+> [!NOTE]
+> Alibaba Cloud recommends prioritizing system voices for more consistent synthesis
+> results. Base voices offer more options; listen to the previews and evaluate them
+> before use.
 
-### Voices of sibling models (for reference — do NOT pass to `plus`)
+### Voices of sibling models
 
-- `qwen-audio-3.0-tts-flash` system voices: `longanfengyue`, `longanyuanfei`, `longanlingxi`,
-  `longanxiaoxin`, `longanhuan_v3.6`, `longjielidou_v3.6`, `longpaopao_v3.6`,
-  `longhuohuo_v3.6`, `longchuanshu_v3.6` (ZH+EN), and English-only `loongmary`,
-  `loongeva_v3.6`, `loongjohn`. Its base voices follow `qwen-audio-3.0-tts-flash-<suffix>`
-  ([Excel](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260723/thosjr/qwen-audio-3.0-tts-flash%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2.xlsx)).
-- `qwen-audio-3.1-tts-flash` has its own catalog: 4 multilingual/dialect voices
-  (`longanhuan_v3.1`, `longanlingxin_v3.1`, `longanfengyue_v3.1`, `xunanchuan_v3.1`),
-  premium Chinese voices (`yuxiaoyun_v3.1`, `qiaoxiaojiao_v3.1`, …) and 15 accent-marked
-  English voices (`Emily_v3.1`, `Eric_v3.1`, `Abby_v3.1`, `David_v3.1`, …).
-  Multilingual/dialect voices work in Beijing **and Singapore**; other categories Beijing-only.
+Voices of other models must not be passed to `qwen-audio-3.0-tts-plus`.
 
-## Limits (definitive)
+- `qwen-audio-3.0-tts-flash` system voices: `longanfengyue`, `longanyuanfei`,
+  `longanlingxi`, `longanxiaoxin` (Chinese and English); `longanhuan_v3.6`,
+  `longjielidou_v3.6`, `longpaopao_v3.6`, `longhuohuo_v3.6`, `longchuanshu_v3.6`
+  (Chinese and English); `loongmary`, `loongjohn` (English), and `loongeva_v3.6`
+  (English). Its base voices follow the pattern `qwen-audio-3.0-tts-flash-{suffix}`.
+- `qwen-audio-3.1-tts-flash` voices: four multilingual and dialect voices
+  (`longanhuan_v3.1`, `longanlingxin_v3.1`, `longanfengyue_v3.1`,
+  `xunanchuan_v3.1`) that support Chinese dialects (Shanghainese, Cantonese,
+  Northeastern, Chongqing, Shaanxi, Yunnan, Ningbo, Gansu) plus Japanese, Korean,
+  French, German, Portuguese, Italian, Vietnamese, and Indonesian; premium Chinese
+  voices (such as `yuxiaoyun_v3.1` and `qiaoxiaojiao_v3.1`); and 15 English voices
+  with British or American accents (`Emily_v3.1`, `Luna_v3.1`, `Eric_v3.1`,
+  `Luca_v3.1`, `Abby_v3.1`, `Annie_v3.1`, `Ava_v3.1`, `Beth_v3.1`, `Betty_v3.1`,
+  `Cally_v3.1`, `Cindy_v3.1`, `Donna_v3.1`, `Andy_v3.1`, `Brian_v3.1`,
+  `David_v3.1`).
 
-| Limit | Value | Source |
-|---|---|---|
-| Text per message | 20,000 chars | docs (WebSocket `continue-task`) |
-| Cumulative text per task | 200,000 chars | docs |
-| Send interval (WebSocket) | ≤ 23 s between messages or connection times out | docs |
-| Practical HTTP ceiling for this bridge | `REQUEST_TIMEOUT` = 120 s ⇒ ~1,300–1,500 spoken chars/request | measured (31 chars ≈ 2.8 s audio) |
-| Audio formats | pcm, wav, mp3 (default), opus | verified |
-| Sample rates | 8000/16000/22050/24000/44100/48000 documented; arbitrary integers accepted | verified |
-| Billing unit | `usage.characters` = input character count | verified |
-| Audio URL validity (non-streaming) | 24 h (`output.audio.url`) | docs |
-| Base64 audio in response | `output.audio.data` populated in streaming mode; our HTTP calls returned a URL | docs + observed |
+## References
 
-## Gotchas
+Official Alibaba Cloud Model Studio documentation (English and Chinese editions):
 
-- **Error messages lie about which parameter is wrong.** Engine error 421 always
-  says "Invalid volume parameter" even when `rate` is out of range; 422 says
-  "Invalid sample rate parameter" for a bad `pitch`. Trust the error *code*.
-- TTS is **stochastic** on the same input (pause counts and durations vary run to
-  run; occasionally two runs are byte-identical — likely per-replica determinism).
-  Pause-measurement experiments must repeat runs.
-- Returned WAV headers can have a **bogus frame count** — compute duration from
-  the actual data chunk length, not `nframes`.
-- Voices are model-family-scoped: passing a `qwen-audio-3.0-tts-flash` voice
-  (e.g. `loongmary`) to `qwen-audio-3.0-tts-plus` returns `[cosyvoice] Engine error [411]`.
-- STT side (`qwen-audio-3.0-asr-flash`, multimodal-generation endpoint): response
-  contains **word-level timestamps** (`output.sentence.words[].begin_time/end_time`),
-  useful for A/B verification of TTS changes.
+- Qwen-Audio-TTS API hub:
+  [EN](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-api) ·
+  [ZH](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-api)
+- Client events — request parameter reference:
+  [EN](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-client-events) ·
+  [ZH](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-client-events)
+- Server events — response events and usage:
+  [EN](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-server-events) ·
+  [ZH](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-server-events)
+- Model connection options (WebSocket, AOQ, SDKs):
+  [EN](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-model-access) ·
+  [ZH](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-model-access)
+- Voice list:
+  [EN](https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-voice-list) ·
+  [ZH](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list)
+- SSML usage and limitations:
+  [EN](https://www.alibabacloud.com/help/en/model-studio/ssml-latex-user-guide#sl01_constraint_h3)
+- Instruction control (real-time TTS user guide):
+  [EN](https://www.alibabacloud.com/help/en/model-studio/realtime-tts-user-guide#12884a10929p9)
+- Voice cloning and voice design HTTP API:
+  [EN](https://www.alibabacloud.com/help/en/model-studio/voice-clone-design-http-api#h2-create)
+- Qwen-TTS API reference (`qwen-tts` / `qwen3-tts-flash`, multimodal-generation
+  endpoint; the source of the 600-character limit and the HTTP audio response
+  fields):
+  [EN](https://www.alibabacloud.com/help/en/model-studio/qwen-tts-api)
 
-## Reproducible probe methodology
+Downloads:
 
-```bash
-# 1. POST a tiny text with the parameter under test inside "input"
-curl -s "$ALI_TTS_URL" -H "Authorization: Bearer $ALI_API_KEY" -H 'Content-Type: application/json' -d '{
-  "model": "qwen-audio-3.0-tts-plus",
-  "input": {"text": "Hi there, this is a quick test.",
-            "voice": "qwen-audio-3.0-tts-plus-loongjameszhao",
-            "format": "wav", "sample_rate": 24000,
-            "rate": 1.3}
-}'
-# 2. Non-streaming responses give output.audio.url (valid 24h) — download the WAV.
-# 3. Verify effect physically: duration (chars→seconds), RMS (volume),
-#    zero-crossing rate (pitch), or STT round-trip through
-#    qwen-audio-3.0-asr-flash (content changes, e.g. hot_fix).
-# 4. Invalid values cost nothing: they return 400 with the engine error code,
-#    which is how the ranges above were mapped.
-```
-
-## Reference links
-
-Official docs (EN / ZH — ZH pages render more content server-side):
-
-- Qwen-Audio-TTS API hub: <https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-api> / <https://help.aliyun.com/zh/model-studio/qwen-audio-tts-api>
-- **Client events (primary parameter reference)**: <https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-client-events> / <https://help.aliyun.com/zh/model-studio/qwen-audio-tts-client-events>
-- Server events (response/task lifecycle): <https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-server-events> / <https://help.aliyun.com/zh/model-studio/qwen-audio-tts-server-events>
-- Model connection options (WebSocket/AOQ/SDKs): <https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-model-access> / <https://help.aliyun.com/zh/model-studio/qwen-audio-tts-model-access>
-- Voice list: <https://www.alibabacloud.com/help/en/model-studio/qwen-audio-tts-voice-list> / <https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list>
-- SSML usage & restrictions: <https://www.alibabacloud.com/help/en/model-studio/ssml-latex-user-guide#sl01_constraint_h3>
-- Instruction control (realtime TTS user guide): <https://www.alibabacloud.com/help/en/model-studio/realtime-tts-user-guide#12884a10929p9>
-- Voice cloning/design HTTP API: <https://www.alibabacloud.com/help/en/model-studio/voice-clone-design-http-api#h2-create>
-- Different family (do not confuse): Qwen-TTS / qwen3-tts-flash on multimodal-generation, 600-char limit: <https://www.alibabacloud.com/help/en/model-studio/qwen-tts-api>
-
-Tip: fetch with a browser User-Agent header; some pages are JS-rendered and
-return only navigation chrome (~3 KB) when the slug is wrong or the page is a stub.
+- [qwen-audio-3.0-tts-plus base voices (Excel, 597 rows)](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260723/ydwqqz/qwen-audio-3.0-tts-plus%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2.xlsx)
+- [qwen-audio-3.0-tts-flash base voices (Excel)](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260723/thosjr/qwen-audio-3.0-tts-flash%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2.xlsx)
+- [Base voice preview audio package (ZIP, shared by plus and flash)](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260720/tuuuqo/%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2%E8%AF%95%E5%90%AC%E9%9F%B3%E9%A2%91%E5%8C%85.zip)

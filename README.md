@@ -210,7 +210,7 @@ Every TTS request must pass a `voice`. The examples use `qwen-audio-3.0-tts-plus
 (English news-anchor male).
 
 - Base voices use the full name `qwen-audio-3.0-tts-plus-<suffix>` (597 exist; exactly 8 are
-  English — full table in [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md#voices-supported-by-qwen-audio-30-tts-plus)).
+  English — full table in [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md#voices)).
 - System voices use short names, e.g. `longanlingxin` (F, ZH+EN) and `longanlufeng` (M, ZH+EN).
 - **Voices cannot be mixed across models.** A voice belonging to another model (e.g.
   `loongmary` from `qwen-audio-3.0-tts-flash`) returns `[cosyvoice:] Engine error [411]`.
@@ -246,7 +246,7 @@ not "10–15 km/h") and keep sentences short.
 The upstream synthesizer exposes further quality parameters (`rate`, `pitch`, `volume`,
 `language_hints`, `hot_fix`, `instruction`, SSML, …) that the bridge does not forward yet —
 see [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md) for the full
-verified parameter/limit table and official documentation links.
+parameter and limits reference with official documentation links.
 
 ## Differences from the real OpenAI API
 
