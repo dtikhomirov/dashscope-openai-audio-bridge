@@ -209,7 +209,8 @@ The API key is never logged in full.
 Every TTS request must pass a `voice`. The examples use `qwen-audio-3.0-tts-plus-loongjameszhao`
 (English news-anchor male).
 
-- Base voices use the full name `qwen-audio-3.0-tts-plus-<suffix>` (597 exist; only ~8 are English).
+- Base voices use the full name `qwen-audio-3.0-tts-plus-<suffix>` (597 exist; exactly 8 are
+  English — full table in [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md#voices-supported-by-qwen-audio-30-tts-plus)).
 - System voices use short names, e.g. `longanlingxin` (F, ZH+EN) and `longanlufeng` (M, ZH+EN).
 - **Voices cannot be mixed across models.** A voice belonging to another model (e.g.
   `loongmary` from `qwen-audio-3.0-tts-flash`) returns `[cosyvoice:] Engine error [411]`.

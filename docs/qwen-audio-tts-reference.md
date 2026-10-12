@@ -31,7 +31,7 @@ bridge uses. Everything marked *verified* was confirmed empirically on:
 | Parameter | Type | Valid values / range | Verified effect | Notes |
 |---|---|---|---|---|
 | `text` | string | ≤ 20,000 chars per message (docs) | — | 5,000 chars accepted empirically |
-| `voice` | string | required | — | See voice list doc; base voices are named `qwen-audio-3.0-tts-plus-<suffix>` |
+| `voice` | string | required | — | See [Voices](#voices-supported-by-qwen-audio-30-tts-plus) below; base voices are named `qwen-audio-3.0-tts-plus-<suffix>` |
 | `format` | string | `pcm`, `wav`, `mp3` (default), `opus` | `flac` → 400 "Request format is invalid!" | |
 | `sample_rate` | int | docs: 8000/16000/22050 (default)/24000/44100/48000 | **arbitrary values honored** — 12345 Hz produced a WAV whose header says 12345 | endpoint is laxer than docs |
 | `rate` | float | **0.5–2.0** (0.4 / 2.1 / 5.0 → 400 err 421) | 0.6 → 4.40 s, 1.0 → 2.80 s, 1.8 → 1.38 s for identical text | speech speed |
@@ -46,6 +46,54 @@ bridge uses. Everything marked *verified* was confirmed empirically on:
 | `bit_rate` | int | 6–510 kbps (mp3/opus only) | `bit_rate=128` measurably changed mp3 size (41.9 KB vs 57.2 KB default for same text) | docs default 32 |
 | `text_type` | string | `PlainText` | byte-identical to omitting | |
 | `enable_aigc_tag` (+`aigc_propagator`, `aigc_propagate_id`) | bool/string | default `false` | not probed | embeds AIGC watermark in wav/mp3/opus |
+
+## Voices supported by `qwen-audio-3.0-tts-plus`
+
+Voice IDs are **case-sensitive** and **cannot be mixed across models** — a voice from
+another model (e.g. `loongmary` from `qwen-audio-3.0-tts-flash`) returns
+`[cosyvoice:] Engine error [411]: TTS speak operation failed` (verified).
+
+### System voices (flagship, 2)
+
+| Voice parameter | Name | Gender | Age | Character | Languages |
+|---|---|---|---|---|---|
+| `longanlingxin` | Long An Ling Xin | F | 25 | warm and empathetic | Chinese (Mandarin), English |
+| `longanlufeng` | Long An Lu Feng | M | 25 | bright and cheerful | Chinese (Mandarin), English |
+
+### Base voices (voice-cloned, 597 total)
+
+Naming pattern: `qwen-audio-3.0-tts-plus-<suffix>`. Language breakdown (from the
+official Excel list): **589 Chinese-only, 8 English**. The 8 English-capable ones:
+
+| Voice parameter | Name | Gender | Age | Character (translated) | Use case |
+|---|---|---|---|---|---|
+| `qwen-audio-3.0-tts-plus-loongjameszhao` | James Zhao | M | 28 | news-broadcast voice ← *used in this repo's examples* | daily conversation |
+| `qwen-audio-3.0-tts-plus-loongolivialin` | Olivia Lin | F | 28 | gentle, intellectual | emotional companionship |
+| `qwen-audio-3.0-tts-plus-loonglunawang` | Luna Wang | F | 21 | smart-assistant voice | daily conversation |
+| `qwen-audio-3.0-tts-plus-loongnorahu` | Nora Hu | F | 25 | lively, spirited | daily conversation |
+| `qwen-audio-3.0-tts-plus-loongivyhu` | Ivy Hu | F | 54 | confident, composed | speech / recitation |
+| `qwen-audio-3.0-tts-plus-loongalexanderhu` | Alexander Hu | M | 27 | retro-cassette voice | daily conversation |
+| `qwen-audio-3.0-tts-plus-loongadriangao` | Adrian Gao | M | 22 | calm, steady | audiobook reading |
+| `qwen-audio-3.0-tts-plus-loongryanma` | Ryan Ma | M | 38 | electronic / trendy | daily conversation |
+
+The full 597-row list (Chinese name, gender, age, character, use case, preview file name)
+is in the official Excel: [qwen-audio-3.0-tts-plus base voices.xlsx](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260723/ydwqqz/qwen-audio-3.0-tts-plus%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2.xlsx)
+(columns: 序号 #, 名称 name, voice参数 voice parameter, 性别 gender, 年龄 age, 特质 character,
+适用场景 use case, 语种 language, 预览音频文件名 preview file).
+Preview audio package (shared with the flash model): [base voice preview audio package.zip](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260720/tuuuqo/%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2%E8%AF%95%E5%90%AC%E9%9F%B3%E9%A2%91%E5%8C%85.zip).
+
+### Voices of sibling models (for reference — do NOT pass to `plus`)
+
+- `qwen-audio-3.0-tts-flash` system voices: `longanfengyue`, `longanyuanfei`, `longanlingxi`,
+  `longanxiaoxin`, `longanhuan_v3.6`, `longjielidou_v3.6`, `longpaopao_v3.6`,
+  `longhuohuo_v3.6`, `longchuanshu_v3.6` (ZH+EN), and English-only `loongmary`,
+  `loongeva_v3.6`, `loongjohn`. Its base voices follow `qwen-audio-3.0-tts-flash-<suffix>`
+  ([Excel](https://help-static-aliyun-doc.aliyuncs.com/file-manage-files/zh-CN/20260723/thosjr/qwen-audio-3.0-tts-flash%E5%9F%BA%E7%A1%80%E9%9F%B3%E8%89%B2.xlsx)).
+- `qwen-audio-3.1-tts-flash` has its own catalog: 4 multilingual/dialect voices
+  (`longanhuan_v3.1`, `longanlingxin_v3.1`, `longanfengyue_v3.1`, `xunanchuan_v3.1`),
+  premium Chinese voices (`yuxiaoyun_v3.1`, `qiaoxiaojiao_v3.1`, …) and 15 accent-marked
+  English voices (`Emily_v3.1`, `Eric_v3.1`, `Abby_v3.1`, `David_v3.1`, …).
+  Multilingual/dialect voices work in Beijing **and Singapore**; other categories Beijing-only.
 
 ## Limits (definitive)
 
