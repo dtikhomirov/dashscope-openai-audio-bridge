@@ -6,17 +6,30 @@ Studio, with a focus on `qwen-audio-3.0-tts-plus` — the model this bridge call
 the HTTP `SpeechSynthesizer` endpoint. All values are quoted from the official
 documentation listed in [References](#references).
 
+## API families
+
+Two separate speech-synthesis API families exist in Model Studio. They use different
+models, endpoints, and references, and their parameters and limits are not
+interchangeable:
+
+| API family | Models | Endpoint | Official reference |
+|---|---|---|---|
+| **Qwen-Audio-TTS** (this article, except where noted) | `qwen-audio-3.0-tts-plus`, `qwen-audio-3.0-tts-flash`, `qwen-audio-3.1-tts-flash` | Real-time WebSocket / AOQ; HTTP `SpeechSynthesizer` | Client events, server events, voice list |
+| **Qwen-TTS** | `qwen-tts`, `qwen3-tts-flash` | Multimodal-generation | Qwen-TTS API reference |
+
 > [!NOTE]
-> The primary parameter reference for Qwen-Audio-TTS documents the real-time
-> (WebSocket / AOQ) API, where synthesis parameters are sent in the
-> `payload.parameters` object of the `run-task` event and text is sent through
-> `continue-task` events. The HTTP `SpeechSynthesizer` endpoint used by this bridge
-> accepts the same parameter names. The bridge currently forwards `text`, `voice`,
-> `format`, and `sample_rate` inside the `input` object of each request.
+> The Qwen-Audio-TTS parameter reference documents the real-time (WebSocket / AOQ)
+> API, where synthesis parameters are sent in the `payload.parameters` object of the
+> `run-task` event and text is sent through `continue-task` events. The HTTP
+> `SpeechSynthesizer` endpoint used by this bridge accepts the same parameter names.
+> The bridge currently forwards `text`, `voice`, `format`, and `sample_rate` inside
+> the `input` object of each request.
 
 ## Request parameters
 
-The following parameters are documented for Qwen-Audio-TTS speech synthesis tasks.
+The following parameters are documented for **Qwen-Audio-TTS** speech synthesis tasks
+(client-events reference). They do not apply to the Qwen-TTS family, which has its
+own, smaller parameter set.
 
 | Parameter | Type | Required | Default value | Valid values | Description |
 |---|---|---|---|---|---|
@@ -54,8 +67,8 @@ The `hot_fix` object supports two fields:
 | Text per message | 20,000 characters | Qwen-Audio-TTS synthesis tasks |
 | Cumulative text per task | 200,000 characters | Qwen-Audio-TTS synthesis tasks |
 | Interval between text messages | 23 seconds; longer intervals time out the connection | WebSocket API |
-| Input text length | 600 characters | `qwen-tts` and `qwen3-tts-flash` on the multimodal-generation endpoint only |
-| Audio URL validity | 24 hours | `output.audio.url` in HTTP non-streaming responses |
+| Input text length | 600 characters | **Qwen-TTS family only** (`qwen-tts`, `qwen3-tts-flash`, multimodal-generation endpoint) — does not apply to Qwen-Audio-TTS |
+| Audio URL validity | 24 hours | `output.audio.url` in HTTP non-streaming responses (Qwen-TTS API reference; the same field is returned by the `SpeechSynthesizer` endpoint this bridge uses) |
 | Voice availability by region | Multilingual and dialect voices: Beijing and Singapore. All other voice categories: Beijing only | `qwen-audio-3.1-tts-flash` |
 | Bridge request timeout | `REQUEST_TIMEOUT` (120 seconds in `.env.example`) | This bridge; long texts may exceed the timeout before synthesis completes |
 
@@ -67,21 +80,34 @@ The `hot_fix` object supports two fields:
 
 ## Response and billing
 
-In the real-time API, the server returns `task-started`, `result-generated`, and
-`task-finished` events. Each `result-generated` event carries sentence-level metadata
-with the sub-event types `sentence-begin`, `sentence-synthesis`, and `sentence-end`.
-One audio frame is transmitted over the WebSocket binary channel immediately after
-each `sentence-synthesis` event. The `sentence-end` event returns the sentence text,
-word-level timestamps (`sentence.words`, with `begin_time` and `end_time` in
-milliseconds), and billing usage.
+### Real-time API responses (Qwen-Audio-TTS)
 
-Billing usage is reported as `usage.characters` — the number of characters in the
-input text.
+Per the server-events reference, the server returns `task-started`,
+`result-generated`, and `task-finished` events. Each `result-generated` event carries
+sentence-level metadata with the sub-event types `sentence-begin`,
+`sentence-synthesis`, and `sentence-end`. One audio frame is transmitted over the
+WebSocket binary channel immediately after each `sentence-synthesis` event. The
+`sentence-end` event returns the sentence text, word-level timestamps
+(`sentence.words`, with `begin_time` and `end_time` in milliseconds), and billing
+usage (`usage.characters` — the number of characters in the input text).
 
-For HTTP non-streaming synthesis, the Qwen-TTS API reference documents the following
-response fields: `output.audio.url` (the URL of the complete audio file, valid for
-24 hours), `output.audio.expires_at`, and `output.audio.data` (base64-encoded audio;
-populated only in streaming mode).
+### HTTP response fields (Qwen-TTS API reference)
+
+The following fields are documented in the **Qwen-TTS** API reference, which covers
+the `qwen-tts` / `qwen3-tts-flash` models on the multimodal-generation endpoint:
+
+- `output.audio.url` — the URL of the complete audio file, valid for 24 hours.
+  Returned directly in non-streaming responses; in streaming mode, only in the last
+  SSE chunk.
+- `output.audio.expires_at` — the URL expiration timestamp.
+- `output.audio.data` — base64-encoded audio data; an empty string in non-streaming
+  mode.
+- `usage.characters` — the number of characters in the input text (documented as
+  returned by the Qwen3-TTS-Flash model).
+
+Alibaba Cloud does not publish a separate HTTP reference for Qwen-Audio-TTS. The
+`SpeechSynthesizer` endpoint this bridge calls returns audio in the same
+`output.audio.url` field, and the bridge downloads the audio from that URL.
 
 ## Voices
 
