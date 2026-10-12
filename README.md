@@ -242,6 +242,11 @@ Plain prose passes through unchanged. For best results also send speakable text 
 client: prefer words over symbols ("23 degrees" not "23°", "10 to 15 kilometers per hour"
 not "10–15 km/h") and keep sentences short.
 
+The upstream synthesizer exposes further quality parameters (`rate`, `pitch`, `volume`,
+`language_hints`, `hot_fix`, `instruction`, SSML, …) that the bridge does not forward yet —
+see [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md) for the full
+verified parameter/limit table and official documentation links.
+
 ## Differences from the real OpenAI API
 
 - No streaming responses (`stream=true` is ignored); TTS returns the whole audio body.
