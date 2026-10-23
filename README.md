@@ -211,6 +211,9 @@ The API key is never logged in full.
 Every TTS request must pass a `voice`. The examples use `qwen-audio-3.0-tts-plus-loongjameszhao`
 (English news-anchor male).
 
+- **Voice names are passed through verbatim** — the bridge does not map OpenAI stock voices
+  (`alloy`, `echo`, `nova`, …) to DashScope voices. Always send a DashScope voice ID; an
+  OpenAI name reaches the engine unmapped and fails with `[cosyvoice:] Engine error [411]`.
 - Base voices use the full name `qwen-audio-3.0-tts-plus-<suffix>` (597 exist; exactly 8 are
   English — full table in [`docs/qwen-audio-tts-reference.md`](docs/qwen-audio-tts-reference.md#voices)).
 - System voices use short names, e.g. `longanlingxin` (F, ZH+EN) and `longanlufeng` (M, ZH+EN).
@@ -266,6 +269,8 @@ parameter and limits reference with official documentation links.
 
 ## Differences from the real OpenAI API
 
+- `model` and `voice` are **pass-through DashScope identifiers** — no translation of OpenAI
+  names (`gpt-4o-mini-tts`, `alloy`, …); requests must target DashScope models/voices directly.
 - No streaming responses (`stream=true` is ignored); TTS returns the whole audio body.
 - `transcriptions` supports `verbose_json`/`srt`/`vtt` response formats: not implemented — always `{"text": ...}`.
 - `speed` is forwarded as the upstream `rate`, clamped to 0.5–2.0 (upstream limit);
@@ -282,7 +287,7 @@ parameter and limits reference with official documentation links.
 | `401 InvalidApiKey` from upstream | Key does not match the configured `ALI_TTS_URL`/`ALI_STT_URL` host (e.g. key issued for a different region/deployment) |
 | `404` on TTS/STT | Requested model not available for your account/region |
 | `400 'model'/'voice' is required` | OpenAI spec requires `model` in every request and `voice` for TTS — add them to the JSON body (TTS) or form (STT) |
-| `[cosyvoice:] Engine error [411]` | Voice does not belong to the requested model — see [Voices](#voices) |
+| `[cosyvoice:] Engine error [411]` | Voice does not belong to the requested model, or is an OpenAI stock name (`alloy`, …) — names pass through unmapped, see [Voices](#voices) |
 | `413 Audio too large` | Upload exceeds `MAX_BASE64_BYTES` (ASR limit: 10 MB / 5 min) |
 | Empty `{"text": ""}` | Silent/unintelligible audio, or wrong `language` hint |
 | Short pauses/breaks in TTS audio | The engine inserts stochastic prosodic silences at punctuation (not transport). The bridge normalizes text and caps silences at `TTS_SILENCE_CAP_MS` for wav/pcm — see [Smooth speech](#smooth-speech). Try `speed` ≈ 1.15–1.25 or a different voice |
