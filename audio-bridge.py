@@ -19,10 +19,12 @@ import os
 import re
 import wave
 from array import array
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
-import requests
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+import httpx
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 
 LOG_FORMAT = "%(asctime)s %(levelname)-8s [audio-bridge] %(message)s"
@@ -35,6 +37,24 @@ log = logging.getLogger("audio-bridge")
 def mask_key(key: str) -> str:
     """Never log the full API key - show a prefix and length only."""
     return f"{key[:6]}*** ({len(key)} chars)" if key else "<empty>"
+
+
+# Allowed TTS output formats - the set qwen-audio-tts supports (see
+# docs/qwen-audio-tts-reference.md) - mapped to the Content-Type returned to
+# the client. Validates TTS_FORMAT at startup and response_format per request.
+TTS_MEDIA_TYPES = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "opus": "audio/ogg",
+    "pcm": "audio/pcm",
+}
+
+# Accepted TTS sample-rate bounds in Hz (env default and per-request override).
+TTS_SAMPLE_RATE_RANGE = (1000, 192000)
+
+# httpx.InvalidURL is not a RequestError subclass, but a malformed URL (from
+# config or an upstream response) must surface as a 502, not an unhandled 500.
+UPSTREAM_HTTP_ERRORS = (httpx.RequestError, httpx.InvalidURL)
 
 
 class Settings:
@@ -87,7 +107,12 @@ class Settings:
         self.ali_tts_url = as_url("ALI_TTS_URL")
         self.ali_stt_url = as_url("ALI_STT_URL")
         self.tts_format = raw("TTS_FORMAT")
-        self.tts_sample_rate = as_int("TTS_SAMPLE_RATE", 1000, 192000)
+        if self.tts_format and self.tts_format not in TTS_MEDIA_TYPES:
+            problems.append(
+                f"TTS_FORMAT: must be one of {', '.join(sorted(TTS_MEDIA_TYPES))}, "
+                f"got {self.tts_format!r}"
+            )
+        self.tts_sample_rate = as_int("TTS_SAMPLE_RATE", *TTS_SAMPLE_RATE_RANGE)
         self.request_timeout = as_positive_float("REQUEST_TIMEOUT")
         self.max_base64_bytes = as_int("MAX_BASE64_BYTES", 1, 100 * 1024 * 1024)
         # 0 disables silence smoothing; otherwise internal silences in TTS audio
@@ -112,7 +137,23 @@ class Settings:
 settings = Settings()
 log.setLevel(settings.log_level)
 
-app = FastAPI(title="DashScope OpenAI Audio Bridge")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Shared async HTTP client: non-blocking upstream calls + connection pooling.
+    # Using async handlers with a sync client (requests) would block the event
+    # loop and serialize every request; httpx keeps the bridge concurrent.
+    # follow_redirects=True: requests (the previous client) followed redirects
+    # by default, and DashScope download URLs may redirect (OSS/CDN, http->https).
+    app.state.http = httpx.AsyncClient(
+        timeout=settings.request_timeout, follow_redirects=True
+    )
+    try:
+        yield
+    finally:
+        await app.state.http.aclose()
+
+
+app = FastAPI(title="DashScope OpenAI Audio Bridge", lifespan=lifespan)
 
 # Extension -> (DashScope format name, MIME type). Static protocol mapping, not configuration.
 AUDIO_FORMATS = {
@@ -287,24 +328,37 @@ def smooth_tts_audio(content: bytes, fmt: str, sample_rate: int, cap_ms: int) ->
         return content
 
 
-def extract_asr_text(output: dict) -> str:
-    """Pull recognized text out of the DashScope ASR response (several shapes seen in the wild)."""
+def extract_asr_text(output) -> str:
+    """Pull recognized text out of the DashScope ASR response (several shapes seen
+    in the wild). Tolerates unexpected types: anything unrecognized yields ""."""
+    if not isinstance(output, dict):
+        return ""
+
+    def text_of(item) -> str:
+        """item['text'] when item is a dict holding a str, else ""."""
+        if isinstance(item, dict):
+            value = item.get("text")
+            if isinstance(value, str):
+                return value
+        return ""
+
     sentences = output.get("sentences")
     if isinstance(sentences, list) and sentences:
-        return " ".join(s.get("text", "") for s in sentences).strip()
+        return " ".join(t for t in map(text_of, sentences) if t).strip()
 
     sentence = output.get("sentence")
     if isinstance(sentence, dict):
-        return sentence.get("text", "").strip()
+        return text_of(sentence).strip()
     if isinstance(sentence, list):
-        return " ".join(s.get("text", "") for s in sentence).strip()
+        return " ".join(t for t in map(text_of, sentence) if t).strip()
 
     # Chat-completions style fallback
     choices = output.get("choices")
-    if choices:
-        content = choices[0].get("message", {}).get("content")
+    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+        message = choices[0].get("message")
+        content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, list):
-            return " ".join(c.get("text", "") for c in content if isinstance(c, dict)).strip()
+            return " ".join(t for t in map(text_of, content) if t).strip()
         if isinstance(content, str):
             return content.strip()
 
@@ -313,18 +367,18 @@ def extract_asr_text(output: dict) -> str:
 
 @app.get("/health")
 async def health():
+    # Deliberately reveals nothing about the configuration: the endpoint is
+    # unauthenticated, so even masked key material stays out of the response
+    # (it is logged, masked, at startup instead).
     log.debug("Health check requested")
-    return {
-        "status": "ok",
-        "api_key": mask_key(settings.ali_api_key),
-    }
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------
 # 1. TTS: OpenAI /v1/audio/speech -> DashScope SpeechSynthesizer
 # ---------------------------------------------------------
 @app.post("/v1/audio/speech")
-async def openai_tts(payload: dict):
+async def openai_tts(request: Request, payload: dict):
     text = payload.get("input")
     if not isinstance(text, str) or not text.strip():
         log.warning("TTS rejected: request body has no non-empty 'input' string")
@@ -351,11 +405,24 @@ async def openai_tts(payload: dict):
         raise HTTPException(status_code=400, detail="'voice' is required")
     voice = voice.strip()
     fmt = payload.get("response_format") or settings.tts_format
+    if not isinstance(fmt, str) or fmt not in TTS_MEDIA_TYPES:
+        log.warning("TTS rejected: unsupported response_format %r", fmt)
+        raise HTTPException(
+            status_code=400,
+            detail=f"response_format must be one of: {', '.join(sorted(TTS_MEDIA_TYPES))}",
+        )
     try:
         sample_rate = int(payload.get("sample_rate") or settings.tts_sample_rate)
     except (TypeError, ValueError):
         log.warning("TTS rejected: invalid sample_rate %r in request", payload.get("sample_rate"))
         raise HTTPException(status_code=400, detail="sample_rate must be an integer")
+    rate_lo, rate_hi = TTS_SAMPLE_RATE_RANGE
+    if not rate_lo <= sample_rate <= rate_hi:
+        log.warning("TTS rejected: sample_rate %s out of range", sample_rate)
+        raise HTTPException(
+            status_code=400,
+            detail=f"sample_rate must be between {rate_lo} and {rate_hi}",
+        )
 
     # OpenAI 'speed' (0.25-4.0) maps to the upstream 'rate' parameter (0.5-2.0).
     # A slightly elevated rate also measurably shortens prosodic pauses.
@@ -388,40 +455,53 @@ async def openai_tts(payload: dict):
         ali_input["rate"] = rate
     ali_payload = {"model": model, "input": ali_input}
 
+    client = request.app.state.http
     try:
-        resp = requests.post(
+        resp = await client.post(
             settings.ali_tts_url, json=ali_payload, headers=auth_headers(),
-            timeout=settings.request_timeout,
         )
-    except requests.RequestException as exc:
+    except UPSTREAM_HTTP_ERRORS as exc:
         log.error("TTS upstream unreachable (%s): %s", settings.ali_tts_url, exc)
         raise HTTPException(status_code=502, detail=f"Upstream TTS request failed: {exc}")
 
     if resp.status_code != 200:
         log.error("TTS upstream returned %s: %s", resp.status_code, resp.text[:500])
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Upstream TTS error (HTTP {resp.status_code}): {resp.text[:200]}",
+        )
 
-    data = resp.json()
-    audio = data.get("output", data).get("audio") or {}
+    # Parse defensively: a 200 with a non-JSON or unexpectedly shaped body must
+    # surface as a 502, not an unhandled exception (500).
+    try:
+        data = resp.json()
+        audio = (data.get("output") or data).get("audio") or {}
+        b64_data = audio.get("data")
+        audio_url = audio.get("url")
+        content = base64.b64decode(b64_data) if b64_data else None
+    except (ValueError, AttributeError, TypeError) as exc:
+        log.error("TTS upstream response malformed (%s): %.500s", exc, resp.text)
+        raise HTTPException(status_code=502, detail="Upstream TTS response was malformed")
 
-    if audio.get("data"):
-        content = base64.b64decode(audio["data"])
-    elif audio.get("url"):
-        # Non-streaming mode returns a download URL (valid 24h)
-        try:
-            dl = requests.get(audio["url"], timeout=settings.request_timeout)
-        except requests.RequestException as exc:
-            log.error("TTS audio download failed: %s", exc)
-            raise HTTPException(status_code=502, detail=f"Failed to download synthesized audio: {exc}")
-        if dl.status_code != 200:
-            log.error("TTS audio download returned %s", dl.status_code)
+    if not content:
+        if isinstance(audio_url, str) and audio_url:
+            # Non-streaming mode returns a download URL (valid 24h)
+            try:
+                dl = await client.get(audio_url)
+            except UPSTREAM_HTTP_ERRORS as exc:
+                log.error("TTS audio download failed: %s", exc)
+                raise HTTPException(status_code=502, detail=f"Failed to download synthesized audio: {exc}")
+            if dl.status_code != 200:
+                log.error("TTS audio download returned %s", dl.status_code)
+                raise HTTPException(
+                    status_code=502, detail=f"Failed to download synthesized audio: {dl.status_code}"
+                )
+            content = dl.content
+        if not content:
+            log.error("TTS upstream response contained no audio: %s", str(data)[:500])
             raise HTTPException(
-                status_code=502, detail=f"Failed to download synthesized audio: {dl.status_code}"
+                status_code=502, detail="Upstream TTS response contained no audio"
             )
-        content = dl.content
-    else:
-        log.error("TTS upstream response contained no audio: %s", str(data)[:500])
-        raise HTTPException(status_code=502, detail=f"No audio in DashScope response: {data}")
 
     if settings.tts_silence_cap_ms > 0:
         smoothed = smooth_tts_audio(content, fmt, sample_rate, settings.tts_silence_cap_ms)
@@ -432,7 +512,7 @@ async def openai_tts(payload: dict):
             )
             content = smoothed
 
-    media_type = "audio/mpeg" if fmt == "mp3" else f"audio/{fmt}"
+    media_type = TTS_MEDIA_TYPES[fmt]
     log.info("TTS success: returned %d bytes of %s", len(content), media_type)
     return Response(content=content, media_type=media_type)
 
@@ -442,9 +522,10 @@ async def openai_tts(payload: dict):
 # ---------------------------------------------------------
 @app.post("/v1/audio/transcriptions")
 async def openai_transcriptions(
+    request: Request,
     file: UploadFile = File(...),
-    model: str = Form(None),
-    language: str = Form(None),
+    model: Optional[str] = Form(None),
+    language: Optional[str] = Form(None),
 ):
     # OpenAI spec: 'model' is a required field of POST /v1/audio/transcriptions
     if not model or not model.strip():
@@ -452,7 +533,30 @@ async def openai_transcriptions(
         raise HTTPException(status_code=400, detail="'model' form field is required")
     model = model.strip()
 
-    content = await file.read()
+    # Bound memory: never buffer more than the configured limit. base64 expands
+    # data (~4/3x), so any raw upload larger than max_base64_bytes would fail the
+    # exact base64 check below regardless - reject it during the read instead of
+    # after fully buffering + encoding a potentially huge file.
+    limit = settings.max_base64_bytes
+    chunks: list[bytes] = []
+    received = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        received += len(chunk)
+        if received > limit:
+            break
+    content = b"".join(chunks)
+    if received > limit:
+        log.warning(
+            "STT rejected: upload %r exceeds the %d-byte limit", file.filename, limit
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"Audio too large: exceeds the {limit}-byte upload limit",
+        )
     if not content:
         log.warning("STT rejected: uploaded file %r is empty", file.filename)
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -502,21 +606,28 @@ async def openai_transcriptions(
     headers = auth_headers()
     headers["X-DashScope-SSE"] = "disable"
 
+    client = request.app.state.http
     try:
-        resp = requests.post(
+        resp = await client.post(
             settings.ali_stt_url, json=ali_payload, headers=headers,
-            timeout=settings.request_timeout,
         )
-    except requests.RequestException as exc:
+    except UPSTREAM_HTTP_ERRORS as exc:
         log.error("STT upstream unreachable (%s): %s", settings.ali_stt_url, exc)
         raise HTTPException(status_code=502, detail=f"Upstream STT request failed: {exc}")
 
     if resp.status_code != 200:
         log.error("STT upstream returned %s: %s", resp.status_code, resp.text[:500])
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        raise HTTPException(
+            status_code=resp.status_code,
+            detail=f"Upstream STT error (HTTP {resp.status_code}): {resp.text[:200]}",
+        )
 
-    data = resp.json()
-    output = data.get("output", data)
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        log.error("STT upstream returned a non-JSON body (%s): %.500s", exc, resp.text)
+        raise HTTPException(status_code=502, detail="Upstream STT returned a non-JSON response")
+    output = data.get("output", data) if isinstance(data, dict) else {}
     text = extract_asr_text(output)
     if not text:
         log.warning(

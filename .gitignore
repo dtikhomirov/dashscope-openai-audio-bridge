@@ -221,3 +221,6 @@ __marimo__/
 
 # local artifacts
 voice-samples/
+
+# macOS
+.DS_Store

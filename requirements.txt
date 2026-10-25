@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-requests
-python-multipart
+fastapi==0.142.2
+uvicorn==0.54.0
+httpx==0.28.1
+python-multipart==0.0.32

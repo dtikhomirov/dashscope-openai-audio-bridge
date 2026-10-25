@@ -177,7 +177,7 @@ per problem and exits with code `2` instead of serving a misconfigured API.
 | `BRIDGE_PORT` | `4005` | Port the bridge listens on (1–65535) |
 | `ALI_TTS_URL` | `https://<dashscope-host>/api/v1/services/audio/tts/SpeechSynthesizer` | TTS endpoint (http/https URL) |
 | `ALI_STT_URL` | `https://<dashscope-host>/api/v1/services/aigc/multimodal-generation/generation` | STT endpoint (http/https URL) |
-| `TTS_FORMAT` | `wav` | Default output format (`wav`, `mp3`, …) |
+| `TTS_FORMAT` | `wav` | Default TTS output format — one of `wav`, `mp3`, `opus`, `pcm` |
 | `TTS_SAMPLE_RATE` | `24000` | Output sample rate in Hz (1000–192000) |
 | `REQUEST_TIMEOUT` | `120` | Upstream HTTP timeout in seconds (> 0) |
 | `MAX_BASE64_BYTES` | `10485760` | Max base64-encoded upload size for ASR (API limit: 10 MB) |
@@ -188,7 +188,9 @@ Per the OpenAI spec, `model` is **required in every request** (JSON body for TTS
 form for STT) and `voice` is **required for TTS**; they select the DashScope model and voice
 to call. Optional per-request overrides with env defaults (TTS only): `response_format`,
 `sample_rate`; `speed` is forwarded as the upstream `rate`. STT accepts an optional
-`language` hint.
+`language` hint. Overrides are validated: `response_format` must be one of `wav`, `mp3`,
+`opus`, `pcm` (the set the upstream engine supports) and `sample_rate` must be within
+1000–192000 Hz — anything else is rejected with `400`.
 
 ## Logging
 
@@ -272,6 +274,8 @@ parameter and limits reference with official documentation links.
 - `model` and `voice` are **pass-through DashScope identifiers** — no translation of OpenAI
   names (`gpt-4o-mini-tts`, `alloy`, …); requests must target DashScope models/voices directly.
 - No streaming responses (`stream=true` is ignored); TTS returns the whole audio body.
+- TTS `response_format` is limited to the upstream-supported set (`wav`, `mp3`, `opus`,
+  `pcm`); OpenAI's `aac`/`flac` are rejected with `400`.
 - `transcriptions` supports `verbose_json`/`srt`/`vtt` response formats: not implemented — always `{"text": ...}`.
 - `speed` is forwarded as the upstream `rate`, clamped to 0.5–2.0 (upstream limit);
   `instructions`/`prompt` are not supported; `temperature` is ignored.
@@ -298,6 +302,9 @@ parameter and limits reference with official documentation links.
 .venv/bin/python -m py_compile audio-bridge.py   # syntax check
 .venv/bin/python audio-bridge.py                 # run
 curl -s http://localhost:4005/health             # smoke test
+
+.venv/bin/python -m pip install -r requirements-dev.txt   # test dependencies (pytest)
+.venv/bin/python -m pytest tests -q                       # unit + endpoint tests (no network)
 ```
 
 ## License
