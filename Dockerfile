@@ -8,6 +8,13 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# ffmpeg powers the local decode -> re-encode pipeline for opus/mp3 responses
+# (fixes DashScope's broken ogg granule clock and enables silence smoothing).
+# Without it the bridge still runs, passing upstream audio through unchanged.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

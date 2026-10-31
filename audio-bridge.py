@@ -11,12 +11,14 @@ startup and exits with a meaningful log message if anything is missing or
 invalid.
 """
 
+import asyncio
 import base64
 import io
 import logging
 import math
 import os
 import re
+import shutil
 import wave
 from array import array
 from contextlib import asynccontextmanager
@@ -52,6 +54,17 @@ TTS_MEDIA_TYPES = {
 # Accepted TTS sample-rate bounds in Hz (env default and per-request override).
 TTS_SAMPLE_RATE_RANGE = (1000, 192000)
 
+# Formats delivered via a local decode -> re-encode pipeline (see
+# postprocess_compressed_audio). DashScope's own opus/ogg muxer writes a 5:3
+# inflated granule clock (RFC 7845 violation), which makes granulepos-based
+# players (e.g. Telegram voice notes) drop ~40 ms of audio every 100 ms.
+REENCODE_FORMATS = ("opus", "mp3")
+
+# ffmpeg is optional at runtime: without it, compressed formats fall back to
+# passing the upstream audio through unchanged (logged as a warning).
+FFMPEG = shutil.which("ffmpeg")
+FFMPEG_TIMEOUT_S = 30
+
 # httpx.InvalidURL is not a RequestError subclass, but a malformed URL (from
 # config or an upstream response) must surface as a 502, not an unhandled 500.
 UPSTREAM_HTTP_ERRORS = (httpx.RequestError, httpx.InvalidURL)
@@ -82,6 +95,20 @@ class Settings:
                 problems.append(f"{name}: must be between {lo} and {hi}, got {number}")
             return number
 
+        def opt_int(name: str, lo: int, hi: int, default: int) -> int:
+            """Optional integer with a built-in default (unset/empty -> default)."""
+            value = (os.getenv(name) or "").strip()
+            if not value:
+                return default
+            try:
+                number = int(value)
+            except ValueError:
+                problems.append(f"{name}: must be an integer, got {value!r}")
+                return default
+            if not lo <= number <= hi:
+                problems.append(f"{name}: must be between {lo} and {hi}, got {number}")
+            return number
+
         def as_positive_float(name: str) -> float:
             value = raw(name)
             if not value:
@@ -107,16 +134,21 @@ class Settings:
         self.ali_tts_url = as_url("ALI_TTS_URL")
         self.ali_stt_url = as_url("ALI_STT_URL")
         self.tts_format = raw("TTS_FORMAT")
+        if self.tts_format == "ogg":
+            self.tts_format = "opus"  # colloquial OpenAI-ecosystem alias
         if self.tts_format and self.tts_format not in TTS_MEDIA_TYPES:
             problems.append(
-                f"TTS_FORMAT: must be one of {', '.join(sorted(TTS_MEDIA_TYPES))}, "
-                f"got {self.tts_format!r}"
+                f"TTS_FORMAT: must be one of {', '.join(sorted(TTS_MEDIA_TYPES))} "
+                f"(or 'ogg' as an alias of 'opus'), got {self.tts_format!r}"
             )
         self.tts_sample_rate = as_int("TTS_SAMPLE_RATE", *TTS_SAMPLE_RATE_RANGE)
+        # Bitrate (kbps) for locally re-encoded opus output. Default 32 matches
+        # DashScope's documented opus bit_rate default (valid range 6-510).
+        self.tts_opus_bitrate = opt_int("TTS_OPUS_BITRATE", 6, 510, 32)
         self.request_timeout = as_positive_float("REQUEST_TIMEOUT")
         self.max_base64_bytes = as_int("MAX_BASE64_BYTES", 1, 100 * 1024 * 1024)
         # 0 disables silence smoothing; otherwise internal silences in TTS audio
-        # longer than this cap are shortened (wav/pcm responses only).
+        # longer than this cap are shortened (all formats; opus/mp3 need ffmpeg).
         self.tts_silence_cap_ms = as_int("TTS_SILENCE_CAP_MS", 0, 10000)
 
         log_level = raw("LOG_LEVEL").upper()
@@ -147,6 +179,13 @@ async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(
         timeout=settings.request_timeout, follow_redirects=True
     )
+    if FFMPEG:
+        log.info("ffmpeg found (%s) - opus/mp3 responses are locally re-encoded", FFMPEG)
+    else:
+        log.warning(
+            "ffmpeg not found - opus/mp3 responses pass through unchanged "
+            "(no silence smoothing, upstream granule clock kept)"
+        )
     try:
         yield
     finally:
@@ -328,6 +367,79 @@ def smooth_tts_audio(content: bytes, fmt: str, sample_rate: int, cap_ms: int) ->
         return content
 
 
+# ---------------------------------------------------------
+# Compressed-format postprocessing: DashScope's opus/ogg muxer advances the
+# granule position by 4800 per page while each page carries a 2880-sample
+# (60 ms) packet - a constant 5:3 inflation that violates RFC 7845 §4
+# (measured: 22.2 s claimed vs 13.3 s decoded PCM). Players that build the
+# timeline from granulepos (Telegram voice notes) therefore drop ~40 ms every
+# 100 ms. Remuxing (-c:a copy) does not repair it; only decode -> re-encode
+# rewrites a correct granule clock. The pipeline also applies silence
+# smoothing to compressed formats, which smooth_tts_audio() cannot do.
+# ---------------------------------------------------------
+async def _ffmpeg_run(args: list, stdin_data: bytes) -> bytes:
+    """Run ffmpeg with piped stdin/stdout; raise on failure or timeout."""
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG, *args,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(stdin_data), timeout=FFMPEG_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError(f"ffmpeg timed out after {FFMPEG_TIMEOUT_S}s")
+    if proc.returncode != 0:
+        raise RuntimeError(err.decode(errors="replace").strip()[:200] or f"exit {proc.returncode}")
+    return out
+
+
+async def postprocess_compressed_audio(
+    content: bytes, fmt: str, sample_rate: int, cap_ms: int, opus_bitrate: int
+) -> bytes:
+    """Decode upstream wav -> optional silence compression -> re-encode to the
+    requested compressed format (correct granule clock). Falls back to the
+    upstream bytes unchanged when ffmpeg is missing or any step fails."""
+    if not FFMPEG:
+        log.warning("re-encode unavailable (%s) - returning upstream audio unchanged", "ffmpeg not found")
+        return content
+    try:
+        pcm = await _ffmpeg_run(
+            ["-v", "error", "-i", "pipe:0",
+             "-f", "s16le", "-ac", "1", "-ar", str(sample_rate), "pipe:1"],
+            content,
+        )
+        samples = array("h")
+        samples.frombytes(pcm[: len(pcm) // 2 * 2])
+        if cap_ms > 0 and len(samples):
+            smoothed = compress_silence(samples, sample_rate, cap_ms)
+            if len(smoothed) != len(samples):
+                log.info(
+                    "Silence smoothing (%s): %d -> %d samples (cap %d ms)",
+                    fmt, len(samples), len(smoothed), cap_ms,
+                )
+            samples = smoothed
+        if fmt == "opus":
+            encoder = ["-c:a", "libopus", "-b:a", f"{opus_bitrate}k", "-ar", str(sample_rate), "-f", "ogg"]
+        else:  # mp3
+            encoder = ["-c:a", "libmp3lame", "-q:a", "4", "-ar", str(sample_rate), "-f", "mp3"]
+        out = await _ffmpeg_run(
+            ["-v", "error", "-f", "s16le", "-ar", str(sample_rate), "-ac", "1",
+             "-i", "pipe:0", *encoder, "pipe:1"],
+            samples.tobytes(),
+        )
+        if not out:
+            raise RuntimeError("encoder produced no output")
+        return out
+    except (OSError, RuntimeError, ValueError) as exc:
+        log.warning("re-encode unavailable (%s) - returning upstream audio unchanged", exc)
+        return content
+
+
 def extract_asr_text(output) -> str:
     """Pull recognized text out of the DashScope ASR response (several shapes seen
     in the wild). Tolerates unexpected types: anything unrecognized yields ""."""
@@ -405,11 +517,14 @@ async def openai_tts(request: Request, payload: dict):
         raise HTTPException(status_code=400, detail="'voice' is required")
     voice = voice.strip()
     fmt = payload.get("response_format") or settings.tts_format
+    if fmt == "ogg":
+        fmt = "opus"  # colloquial OpenAI-ecosystem alias; upstream only knows opus
     if not isinstance(fmt, str) or fmt not in TTS_MEDIA_TYPES:
         log.warning("TTS rejected: unsupported response_format %r", fmt)
         raise HTTPException(
             status_code=400,
-            detail=f"response_format must be one of: {', '.join(sorted(TTS_MEDIA_TYPES))}",
+            detail=f"response_format must be one of: {', '.join(sorted(TTS_MEDIA_TYPES))} "
+                   "('ogg' is accepted as an alias of 'opus')",
         )
     try:
         sample_rate = int(payload.get("sample_rate") or settings.tts_sample_rate)
@@ -444,11 +559,15 @@ async def openai_tts(request: Request, payload: dict):
         model, voice, fmt, sample_rate, speed if speed is not None else "-", len(text),
     )
 
-    # qwen-audio-3.0-tts takes voice/format/sample_rate inside "input"
+    # qwen-audio-3.0-tts takes voice/format/sample_rate inside "input".
+    # Compressed formats are fetched as wav and re-encoded locally: DashScope's
+    # opus muxer writes a broken (5:3 inflated) granule clock, and silence
+    # smoothing needs PCM anyway (see postprocess_compressed_audio).
+    upstream_fmt = "wav" if fmt in REENCODE_FORMATS else fmt
     ali_input = {
         "text": text,
         "voice": voice,
-        "format": fmt,
+        "format": upstream_fmt,
         "sample_rate": sample_rate,
     }
     if rate is not None:
@@ -503,7 +622,17 @@ async def openai_tts(request: Request, payload: dict):
                 status_code=502, detail="Upstream TTS response contained no audio"
             )
 
-    if settings.tts_silence_cap_ms > 0:
+    if fmt in REENCODE_FORMATS:
+        reencoded = await postprocess_compressed_audio(
+            content, fmt, sample_rate,
+            settings.tts_silence_cap_ms, settings.tts_opus_bitrate,
+        )
+        if reencoded is not content:
+            log.info(
+                "Re-encoded upstream wav -> %s: %d -> %d bytes", fmt, len(content), len(reencoded)
+            )
+        content = reencoded
+    elif settings.tts_silence_cap_ms > 0:
         smoothed = smooth_tts_audio(content, fmt, sample_rate, settings.tts_silence_cap_ms)
         if smoothed is not content:
             log.info(

@@ -81,7 +81,9 @@ _Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptio
    The bridge normalizes the text (strips markdown, bullets, emoji and hard line breaks that
    cause audible pauses — see [Smooth speech](#smooth-speech)), calls the DashScope synthesizer (voice/format go **inside `input`**), receives a temporary
    download URL (`output.audio.url`, valid 24 h), fetches the audio, and streams the bytes back with the
-   proper `Content-Type`.
+   proper `Content-Type`. For `opus`/`mp3` the bridge fetches `wav` upstream and re-encodes
+   locally with ffmpeg (silence smoothing + a correct ogg granule clock — see
+   [Why re-encode?](#why-re-encode)).
 2. **STT** — the client uploads an audio file (multipart). The bridge base64-encodes it as a
    `data:audio/...;base64,` URL, calls the ASR model **synchronously** (no polling), and returns
    `{"text": "..."}`. Limits: ≤ 10 MB encoded audio, ≤ 5 min duration.
@@ -91,6 +93,10 @@ _Blue: TTS flow (`/v1/audio/speech`) · Green: STT flow (`/v1/audio/transcriptio
 ### Prerequisites
 
 - Python 3.10+ (or Docker)
+- **ffmpeg** in `PATH` — required for `opus`/`mp3` responses (local re-encode, see
+  [Why re-encode?](#why-re-encode)); the Docker image installs it. Without ffmpeg the
+  bridge still runs and passes upstream compressed audio through unchanged (logged as a
+  warning at startup and per request)
 - An Alibaba Cloud Model Studio (DashScope) API key — from any region/deployment
   (mainland China, International, Token Plan) — with `qwen-audio-3.0-tts-plus`
   and `qwen-audio-3.0-asr-flash` (or equivalent audio models) enabled
@@ -166,7 +172,8 @@ with open("speech.wav", "rb") as f:
 
 ## Configuration (all via environment / `.env`)
 
-The code has **no built-in defaults** — every variable below is required. On startup the bridge
+The code has **no built-in defaults** — every variable below is required (single exception:
+`TTS_OPUS_BITRATE`, which defaults to `32`). On startup the bridge
 validates all values (presence, types, ranges) and, if anything is wrong, logs one clear message
 per problem and exits with code `2` instead of serving a misconfigured API.
 
@@ -177,11 +184,12 @@ per problem and exits with code `2` instead of serving a misconfigured API.
 | `BRIDGE_PORT` | `4005` | Port the bridge listens on (1–65535) |
 | `ALI_TTS_URL` | `https://<dashscope-host>/api/v1/services/audio/tts/SpeechSynthesizer` | TTS endpoint (http/https URL) |
 | `ALI_STT_URL` | `https://<dashscope-host>/api/v1/services/aigc/multimodal-generation/generation` | STT endpoint (http/https URL) |
-| `TTS_FORMAT` | `wav` | Default TTS output format — one of `wav`, `mp3`, `opus`, `pcm` |
+| `TTS_FORMAT` | `opus` | Default TTS output format — one of `wav`, `mp3`, `opus`, `pcm` (`ogg` is accepted as an alias of `opus`; both are served as `audio/ogg`) |
 | `TTS_SAMPLE_RATE` | `24000` | Output sample rate in Hz (1000–192000) |
+| `TTS_OPUS_BITRATE` | `32` | Optional. Bitrate in kbps for locally re-encoded opus output (6–510; default `32`, matching DashScope's documented opus default) |
 | `REQUEST_TIMEOUT` | `120` | Upstream HTTP timeout in seconds (> 0) |
 | `MAX_BASE64_BYTES` | `10485760` | Max base64-encoded upload size for ASR (API limit: 10 MB) |
-| `TTS_SILENCE_CAP_MS` | `250` | Cap for internal silences in wav/pcm TTS output, in ms; `0` disables smoothing (0–10000) |
+| `TTS_SILENCE_CAP_MS` | `250` | Cap for internal silences in TTS output, in ms — applies to **all** formats (opus/mp3 need ffmpeg); `0` disables smoothing (0–10000) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` |
 
 Per the OpenAI spec, `model` is **required in every request** (JSON body for TTS, multipart
@@ -189,8 +197,9 @@ form for STT) and `voice` is **required for TTS**; they select the DashScope mod
 to call. Optional per-request overrides with env defaults (TTS only): `response_format`,
 `sample_rate`; `speed` is forwarded as the upstream `rate`. STT accepts an optional
 `language` hint. Overrides are validated: `response_format` must be one of `wav`, `mp3`,
-`opus`, `pcm` (the set the upstream engine supports) and `sample_rate` must be within
-1000–192000 Hz — anything else is rejected with `400`.
+`opus`, `pcm` (the set the upstream engine supports; `ogg` is accepted as an alias of
+`opus` because the OpenAI ecosystem colloquially calls the format "ogg") and `sample_rate`
+must be within 1000–192000 Hz — anything else is rejected with `400`.
 
 ## Logging
 
@@ -256,10 +265,34 @@ Even with clean text the CosyVoice engine behind Qwen-Audio-TTS inserts stochast
 silences (250–900 ms) at punctuation — no upstream parameter removes them (SSML `<break>`,
 `language_hints` and `instruction` were all measured to make pauses worse or no better). The
 maintainer-recommended fix is postprocessing, so the bridge shortens every internal silence
-longer than `TTS_SILENCE_CAP_MS` (default recommendation: `250`; `0` disables) in `wav`/`pcm`
-responses, with a 4 ms crossfade at each cut. Compressed formats (`mp3`, `opus`, …) pass
-through untouched. Measured on a forecast sample: pauses capped from up to 990 ms to a
+longer than `TTS_SILENCE_CAP_MS` (default recommendation: `250`; `0` disables) in **every
+response format**, with a 4 ms crossfade at each cut: `wav`/`pcm` directly, `opus`/`mp3`
+inside the ffmpeg re-encode pipeline below (without ffmpeg, compressed formats pass through
+unsmoothed). Measured on a forecast sample: pauses capped from up to 990 ms to a
 uniform 250 ms with speech fully intelligible (verified by ASR roundtrip).
+
+### Why re-encode?
+
+`opus`/`mp3` responses are fetched from DashScope as `wav` and re-encoded locally with
+ffmpeg (`libopus` at `TTS_OPUS_BITRATE` kbps / `libmp3lame -q:a 4`). Two reasons, both
+measured against the live upstream:
+
+1. **DashScope's ogg/opus muxer writes a broken granule clock.** RFC 7845 §4 requires a
+   page's granulepos to equal the total PCM sample count up to that page. DashScope advances
+   granulepos by **4800 per page (100 ms) while each page carries one 2880-sample (60 ms)
+   packet — a constant 5:3 inflation** (measured: a file claiming 22.20 s contains 13.30 s of
+   decoded PCM; another claimed 46.40 s vs 27.82 s real). Players that build the playback
+   timeline from granulepos — including Telegram's voice-note player — receive 60 ms of audio
+   per 100 ms of timeline, producing ~40 ms dropouts ≈ 16×/second ("fast interruptions in
+   speech"). Remuxing (`ffmpeg -c:a copy`) does **not** repair it; only decode → re-encode
+   rewrites a correct clock (verified: granule/PCM ratio 1.000 after re-encode, container
+   duration within 0.007 s of decoded PCM).
+2. **Silence smoothing needs PCM**, which the re-encode pipeline has anyway (see above).
+
+If ffmpeg is missing or a subprocess fails/times out (30 s), the bridge logs
+`re-encode unavailable (…) - returning upstream audio unchanged` and passes the upstream
+bytes through — the service never crashes over a missing binary. ffmpeg availability is
+logged once at startup.
 
 Additionally, the OpenAI `speed` parameter is forwarded as the upstream `rate` (clamped to
 the supported 0.5–2.0); values around 1.15–1.25 measurably shorten prosodic pauses.
@@ -275,7 +308,10 @@ parameter and limits reference with official documentation links.
   names (`gpt-4o-mini-tts`, `alloy`, …); requests must target DashScope models/voices directly.
 - No streaming responses (`stream=true` is ignored); TTS returns the whole audio body.
 - TTS `response_format` is limited to the upstream-supported set (`wav`, `mp3`, `opus`,
-  `pcm`); OpenAI's `aac`/`flac` are rejected with `400`.
+  `pcm`, plus `ogg` as an alias of `opus`); OpenAI's `aac`/`flac` are rejected with `400`.
+  `opus`/`mp3` bodies are locally re-encoded, so bytes differ from what DashScope would
+  return directly (correct granule clock, silence cap applied — see
+  [Why re-encode?](#why-re-encode)).
 - `transcriptions` supports `verbose_json`/`srt`/`vtt` response formats: not implemented — always `{"text": ...}`.
 - `speed` is forwarded as the upstream `rate`, clamped to 0.5–2.0 (upstream limit);
   `instructions`/`prompt` are not supported; `temperature` is ignored.
@@ -294,7 +330,9 @@ parameter and limits reference with official documentation links.
 | `[cosyvoice:] Engine error [411]` | Voice does not belong to the requested model, or is an OpenAI stock name (`alloy`, …) — names pass through unmapped, see [Voices](#voices) |
 | `413 Audio too large` | Upload exceeds `MAX_BASE64_BYTES` (ASR limit: 10 MB / 5 min) |
 | Empty `{"text": ""}` | Silent/unintelligible audio, or wrong `language` hint |
-| Short pauses/breaks in TTS audio | The engine inserts stochastic prosodic silences at punctuation (not transport). The bridge normalizes text and caps silences at `TTS_SILENCE_CAP_MS` for wav/pcm — see [Smooth speech](#smooth-speech). Try `speed` ≈ 1.15–1.25 or a different voice |
+| Short pauses/breaks in TTS audio | The engine inserts stochastic prosodic silences at punctuation (not transport). The bridge normalizes text and caps silences at `TTS_SILENCE_CAP_MS` in all formats — see [Smooth speech](#smooth-speech). Try `speed` ≈ 1.15–1.25 or a different voice |
+| Choppy playback / rapid dropouts in players (e.g. Telegram voice notes) | Upstream opus files carry a 5:3-inflated ogg granule clock. Make sure the bridge has ffmpeg (startup log line `ffmpeg found …`) so responses are re-encoded — see [Why re-encode?](#why-re-encode) |
+| Log shows `re-encode unavailable (…) - returning upstream audio unchanged` | ffmpeg is missing or a transcode failed/timed out; opus/mp3 responses pass through with the broken upstream granule clock and no silence smoothing. Install ffmpeg (Docker image includes it) |
 
 ## Development
 
@@ -306,6 +344,9 @@ curl -s http://localhost:4005/health             # smoke test
 .venv/bin/python -m pip install -r requirements-dev.txt   # test dependencies (pytest)
 .venv/bin/python -m pytest tests -q                       # unit + endpoint tests (no network)
 ```
+
+The re-encode pipeline tests use a real ffmpeg and are skipped automatically when it is not
+on `PATH`; all other tests run without it.
 
 ## License
 

@@ -23,7 +23,12 @@ interchangeable:
 > `run-task` event and text is sent through `continue-task` events. The HTTP
 > `SpeechSynthesizer` endpoint used by this bridge accepts the same parameter names.
 > The bridge currently forwards `text`, `voice`, `format`, and `sample_rate` inside
-> the `input` object of each request.
+> the `input` object of each request. For `opus`/`mp3` responses it requests `wav`
+> upstream and re-encodes locally with ffmpeg: DashScope's ogg/opus muxer writes a
+> 5:3-inflated granule clock (4800 granulepos advance per page vs 2880 real PCM
+> samples per packet), violating RFC 7845 §4 and causing ~40 ms dropouts every
+> 100 ms in granulepos-based players (e.g. Telegram voice notes). See README
+> "Why re-encode?".
 
 ## Request parameters
 

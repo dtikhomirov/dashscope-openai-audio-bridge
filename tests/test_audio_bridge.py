@@ -10,9 +10,13 @@ Run:  .venv/bin/python -m pytest tests -q
 import base64
 import importlib.util
 import io
+import itertools
 import json
 import math
 import os
+import shutil
+import struct
+import subprocess
 import wave
 from array import array
 from pathlib import Path
@@ -134,6 +138,47 @@ def make_wav(samples, rate=24000):
         w.setframerate(rate)
         w.writeframes(samples.tobytes())
     return buf.getvalue()
+
+
+# ---------------------------------------------------------
+# ffmpeg helpers (re-encode pipeline tests)
+# ---------------------------------------------------------
+FFMPEG = shutil.which("ffmpeg")
+requires_ffmpeg = pytest.mark.skipif(
+    FFMPEG is None, reason="ffmpeg not installed - re-encode tests need a real ffmpeg"
+)
+
+
+def ffmpeg_run(args, stdin_data):
+    r = subprocess.run(
+        [FFMPEG, *args], input=stdin_data, capture_output=True, timeout=60
+    )
+    assert r.returncode == 0, r.stderr.decode(errors="replace")[:300]
+    return r.stdout
+
+
+def decode_pcm(data, rate):
+    """Decode an audio body to mono s16le samples at `rate` via ffmpeg."""
+    pcm = ffmpeg_run(
+        ["-v", "error", "-i", "pipe:0", "-f", "s16le", "-ac", "1", "-ar", str(rate), "pipe:1"],
+        data,
+    )
+    samples = array("h")
+    samples.frombytes(pcm[: len(pcm) // 2 * 2])
+    return samples
+
+
+def ogg_last_granulepos(data):
+    """Walk Ogg pages and return the final granulepos (RFC 7845: total PCM
+    sample count, in 48 kHz units, up to the end of the last page)."""
+    pos = 0
+    last = 0
+    while pos < len(data) and data[pos:pos + 4] == b"OggS":
+        nsegs = data[pos + 26]
+        body_len = sum(data[pos + 27:pos + 27 + nsegs])
+        last = struct.unpack("<q", data[pos + 6:pos + 14])[0]
+        pos += 27 + nsegs + body_len
+    return last
 
 
 TTS_WAV = make_wav(silence(24000, 0.1))
@@ -273,6 +318,27 @@ def test_settings_rejects_unknown_tts_format(monkeypatch):
     assert excinfo.value.code == 2
 
 
+def test_settings_ogg_format_alias(monkeypatch):
+    for key, value in TEST_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("TTS_FORMAT", "ogg")
+    module = load_fresh_module()
+    assert module.settings.tts_format == "opus"
+
+
+def test_settings_opus_bitrate_default_and_validation(monkeypatch):
+    for key, value in TEST_ENV.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.delenv("TTS_OPUS_BITRATE", raising=False)
+    assert load_fresh_module().settings.tts_opus_bitrate == 32
+    monkeypatch.setenv("TTS_OPUS_BITRATE", "64")
+    assert load_fresh_module().settings.tts_opus_bitrate == 64
+    monkeypatch.setenv("TTS_OPUS_BITRATE", "1000")  # above the 6-510 range
+    with pytest.raises(SystemExit) as excinfo:
+        load_fresh_module()
+    assert excinfo.value.code == 2
+
+
 # ---------------------------------------------------------
 # /health
 # ---------------------------------------------------------
@@ -281,6 +347,16 @@ def test_health_exposes_no_key_material(client, bridge):
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
     assert bridge.settings.ali_api_key[:6] not in r.text
+
+
+def test_health_leaks_nothing(client, bridge):
+    # Guards the deployed-old-build regression: /health once returned
+    # {"status": "ok", "api_key": "sk-...***"}. No key material, ever.
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert "api_key" not in body
+    assert "api_key" not in r.text and bridge.settings.ali_api_key[:6] not in r.text
 
 
 # ---------------------------------------------------------
@@ -363,6 +439,90 @@ def test_tts_media_types(client, bridge, fmt, mime):
     assert r.status_code == 200
     assert r.headers["content-type"] == mime
     assert r.content == b"raw-audio-bytes"
+
+
+# ---------------------------------------------------------
+# Compressed-format re-encode pipeline (granule clock fix + silence cap)
+# ---------------------------------------------------------
+def test_ogg_alias_maps_to_opus(client, bridge):
+    # "ogg" is accepted as an alias of "opus"; upstream is asked for wav
+    # (the re-encode source) and the client gets audio/ogg.
+    fake = use_fake_http(bridge, tts=tts_data_response(TTS_WAV))
+    r = client.post("/v1/audio/speech", json={**TTS_BODY, "response_format": "ogg"})
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/ogg"
+    assert fake.calls[0]["json"]["input"]["format"] == "wav"
+
+
+def test_opus_requested_upstream_as_wav(client, bridge):
+    fake = use_fake_http(bridge, tts=tts_data_response(TTS_WAV))
+    for fmt in ("opus", "mp3"):
+        r = client.post("/v1/audio/speech", json={**TTS_BODY, "response_format": fmt})
+        assert r.status_code == 200
+        assert fake.calls[-1]["json"]["input"]["format"] == "wav"
+
+
+@requires_ffmpeg
+def test_opus_response_granule_matches_pcm(client, bridge):
+    # Bug 1 regression: DashScope's own opus muxer advances granulepos 5:3
+    # faster than real PCM (RFC 7845 §4 violation). The locally re-encoded
+    # response must carry a 1:1 granule clock (± 3000 samples covers the
+    # OpusHead pre-skip / encoder delay).
+    rate = 48000
+    samples = tone(rate, 3.0) + silence(rate, 0.9)
+    use_fake_http(bridge, tts=tts_data_response(make_wav(samples, rate)))
+    r = client.post("/v1/audio/speech", json={
+        **TTS_BODY, "response_format": "opus", "sample_rate": rate,
+    })
+    assert r.status_code == 200
+    assert r.content[:4] == b"OggS"
+    granule = ogg_last_granulepos(r.content)
+    decoded = decode_pcm(r.content, rate)
+    assert granule > 0 and len(decoded) > 0
+    assert abs(granule - len(decoded)) <= 3000
+    # and the duration is right: ~3.9 s of input audio (cap disabled in TEST_ENV)
+    assert abs(len(decoded) / rate - 3.9) < 0.2
+
+
+@requires_ffmpeg
+def test_silence_cap_applies_to_opus(client, bridge, monkeypatch):
+    # Bug 2 regression: TTS_SILENCE_CAP_MS must smooth compressed formats too.
+    monkeypatch.setattr(bridge.settings, "tts_silence_cap_ms", 250)
+    rate = 48000
+    samples = tone(rate, 1.0) + silence(rate, 0.9) + tone(rate, 1.0)
+    use_fake_http(bridge, tts=tts_data_response(make_wav(samples, rate)))
+    r = client.post("/v1/audio/speech", json={
+        **TTS_BODY, "response_format": "opus", "sample_rate": rate,
+    })
+    assert r.status_code == 200
+    decoded = decode_pcm(r.content, rate)
+    # ~650 ms of silence removed
+    assert len(decoded) < len(samples) - int(rate * 0.5)
+    mask = bridge._silence_mask(decoded, rate)
+    longest_ms = max(
+        (len(list(run)) for silent, run in itertools.groupby(mask) if silent),
+        default=0,
+    ) * bridge.SILENCE_FRAME_MS
+    assert longest_ms <= 250 + 60
+
+
+def test_reencode_fallback_without_ffmpeg(client, bridge, monkeypatch):
+    # Missing ffmpeg binary -> upstream audio passes through unchanged (200).
+    monkeypatch.setattr(bridge, "FFMPEG", None)
+    use_fake_http(bridge, tts=tts_data_response(b"raw-audio-bytes"))
+    r = client.post("/v1/audio/speech", json={**TTS_BODY, "response_format": "opus"})
+    assert r.status_code == 200
+    assert r.content == b"raw-audio-bytes"
+    assert r.headers["content-type"] == "audio/ogg"
+
+
+@requires_ffmpeg
+def test_reencode_fallback_on_ffmpeg_failure(client, bridge):
+    # Undecodable upstream body -> warning + unchanged bytes, never a 5xx.
+    use_fake_http(bridge, tts=tts_data_response(b"not-audio-at-all"))
+    r = client.post("/v1/audio/speech", json={**TTS_BODY, "response_format": "opus"})
+    assert r.status_code == 200
+    assert r.content == b"not-audio-at-all"
 
 
 def test_tts_upstream_error_forwarded_truncated(client, bridge):
